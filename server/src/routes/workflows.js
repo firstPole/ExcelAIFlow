@@ -4,7 +4,12 @@ import { v4 as uuidv4 } from 'uuid';
 import { getDb } from '../database/init.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { logger } from '../utils/logger.js';
-
+import { generateBusinessInsights } from '../agents/insightGeneratorAgent.js';
+import { adviseOnDecisions } from '../agents/decisionAdvisorAgent.js';
+// Import the new data aggregator
+import { getAggregatedBusinessData } from '../utils/dataAggregator.js';
+// Import the new LLM Client
+import { callLLM } from '../lib/llmClient.js'; // NEW IMPORT
 const router = express.Router();
 
 // --- Helper Functions (ALL YOUR ORIGINAL HELPER FUNCTIONS ARE RESTORED HERE) ---
@@ -174,7 +179,7 @@ const fetchAndParseFileContent = async (db, fileId, userId) => {
             try {
                 parsedProcessedData = JSON.parse(file.processed_data);
             } catch (e) {
-                logger.error(`[Backend] Failed to parse processed_data for file ${fileId}:`, e);
+                logger.error(`[Backend] Failed to parse processed_data for file ${file.id}:`, e);
                 return null;
             }
         }
@@ -1159,6 +1164,399 @@ router.post('/:workflowId/tasks/:taskId/execute', authenticateToken, async (req,
     }
     res.status(500).json({ message: 'Failed to execute task', error: error.message });
   }
+});
+
+// --- NEW ANALYTICS ENDPOINTS FOR WORKFLOW DATA ---
+
+// Get processing trends (e.g., workflows completed/failed over time)
+router.get('/analytics/processing-trends', authenticateToken, async (req, res) => {
+  try {
+    const db = getDb();
+    const userId = req.user.userId;
+    const { period = '7days' } = req.query; // '7days', '30days', '6months', '12months'
+
+    let groupBy = 'strftime(\'%Y-%m-%d\', created_at)';
+    let dateFilter = 'datetime(\'now\', \'-7 days\')';
+
+    if (period === '30days') {
+      dateFilter = 'datetime(\'now\', \'-30 days\')';
+    } else if (period === '6months') {
+      groupBy = 'strftime(\'%Y-%m\', created_at)';
+      dateFilter = 'datetime(\'now\', \'-6 months\')';
+    } else if (period === '12months') {
+      groupBy = 'strftime(\'%Y-%m\', created_at)';
+      dateFilter = 'datetime(\'now\', \'-12 months\')';
+    }
+
+    const trends = await db.all(`
+      SELECT
+        ${groupBy} as period,
+        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
+        COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
+      FROM workflows
+      WHERE user_id = ? AND created_at >= ${dateFilter}
+      GROUP BY period
+      ORDER BY period ASC
+    `, [userId]);
+
+    // Fill in missing periods with zero counts for a continuous chart
+    const processedTrends = [];
+    const now = new Date();
+    const numPeriods = period === '7days' || period === '30days' ? parseInt(period.replace('days', '')) : (period === '6months' ? 6 : 12);
+
+    for (let i = numPeriods - 1; i >= 0; i--) {
+        let date = new Date(now);
+        let periodLabel;
+
+        if (period.includes('days')) {
+            date.setDate(now.getDate() - i);
+            periodLabel = date.toISOString().split('T')[0]; // YYYY-MM-DD
+        } else { // months
+            date.setMonth(now.getMonth() - i);
+            periodLabel = date.toISOString().substring(0, 7); // YYYY-MM
+        }
+
+        const existing = trends.find(t => t.period === periodLabel);
+        processedTrends.push({
+            period: periodLabel,
+            completed: existing ? existing.completed : 0,
+            failed: existing ? existing.failed : 0
+        });
+    }
+
+    res.json(processedTrends);
+
+  } catch (error) {
+    logger.error('[Backend] Error fetching processing trends:', error);
+    res.status(500).json({ message: 'Failed to fetch processing trends', error: error.message });
+  }
+});
+
+// Get data quality distribution (e.g., breakdown of errors by type or task)
+router.get('/analytics/quality-distribution', authenticateToken, async (req, res) => {
+  try {
+    const db = getDb();
+    const userId = req.user.userId;
+    const { period = '30days' } = req.query; // Filter by recent results
+
+    let dateFunction; // Will hold the SQLite date function string
+    if (period === '7days') {
+      dateFunction = 'datetime(\'now\', \'-7 days\')';
+    } else if (period === '30days') {
+      dateFunction = 'datetime(\'now\', \'-30 days\')';
+    } else if (period === '6months') {
+      dateFunction = 'datetime(\'now\', \'-6 months\')';
+    } else if (period === '12months') {
+      dateFunction = 'datetime(\'now\', \'-12 months\')';
+    } else {
+      dateFunction = 'datetime(\'now\', \'-30 days\')'; // Default
+    }
+
+    // Fetch all relevant workflow results within the period
+    const results = await db.all(`
+      SELECT task_id, output, error, metrics, wr.status AS task_status
+      FROM workflow_results wr
+      JOIN workflows w ON wr.workflow_id = w.id
+      WHERE w.user_id = ? AND wr.completed_at >= ${dateFunction} -- CHANGED: Use dateFunction directly
+      AND wr.status = 'completed'
+    `, [userId]);
+
+    const errorTypeCounts = {};
+    const totalCompletedTasks = results.length;
+    let totalErrorsFound = 0;
+    let totalRecordsProcessed = 0;
+
+    results.forEach(result => {
+      try {
+        const metrics = JSON.parse(result.metrics || '{}');
+        const output = JSON.parse(result.output || '{}');
+
+        // Aggregate records processed
+        if (typeof metrics.recordsProcessed === 'number') {
+            totalRecordsProcessed += metrics.recordsProcessed;
+        } else if (output.metadata && typeof output.metadata.rowCount === 'number') {
+            totalRecordsProcessed += output.metadata.rowCount;
+        } else if (Array.isArray(output)) { // For analyze/clean outputs which are arrays of file data
+            totalRecordsProcessed += output.reduce((sum, item) => sum + (item.metadata?.rowCount || 0), 0);
+        }
+
+        // Aggregate error types if present in metrics.errorsFound (which is an array of strings)
+        if (Array.isArray(metrics.errorsFound) && metrics.errorsFound.length > 0) {
+            totalErrorsFound += metrics.errorsFound.length;
+            metrics.errorsFound.forEach(errorString => {
+                // Simple categorization based on common keywords
+                let errorCategory = 'Other';
+                const lowerError = errorString.toLowerCase();
+                if (lowerError.includes('missing') || lowerError.includes('empty') || lowerError.includes('null')) {
+                    errorCategory = 'Missing Data';
+                } else if (lowerError.includes('duplicate')) {
+                    errorCategory = 'Duplicates';
+                } else if (lowerError.includes('date') || lowerError.includes('format')) {
+                    errorCategory = 'Formatting Issues';
+                } else if (lowerError.includes('outlier') || lowerError.includes('range')) {
+                    errorCategory = 'Outliers/Range';
+                } else if (lowerError.includes('schema') || lowerError.includes('header') || lowerError.includes('inconsistent')) {
+                    errorCategory = 'Schema Inconsistency';
+                } else if (lowerError.includes('invalid') || lowerError.includes('violation')) {
+                    errorCategory = 'Validation Errors';
+                }
+                errorTypeCounts[errorCategory] = (errorTypeCounts[errorCategory] || 0) + 1;
+            });
+        }
+      } catch (parseError) {
+        logger.warn('Failed to parse workflow_results output/metrics for quality distribution:', parseError);
+      }
+    });
+
+    const totalErrorEntries = Object.values(errorTypeCounts).reduce((sum, count) => sum + count, 0);
+    const distributionData = Object.entries(errorTypeCounts).map(([label, count]) => ({
+      name: label,
+      value: totalErrorEntries > 0 ? (count / totalErrorEntries) * 100 : 0 // Percentage
+    }));
+
+    res.json({
+      totalCompletedTasks,
+      totalRecordsProcessed,
+      totalErrorsFound,
+      errorDistribution: distributionData,
+      rawErrorCounts: errorTypeCounts // For debugging/more detailed view
+    });
+
+  } catch (error) {
+    logger.error('[Backend] Error fetching quality distribution:', error);
+    res.status(500).json({ message: 'Failed to fetch data quality distribution', error: error.message });
+  }
+});
+
+// --- NEW AI INSIGHTS ENDPOINT ---
+router.get('/analytics/insights', authenticateToken, async (req, res) => {
+    try {
+        const db = getDb();
+        const userId = req.user.userId;
+        const { period = '30days' } = req.query; // Use period for insights too
+
+        // 1. Fetch user's AI settings
+        const userSettingsRow = await db.get(`SELECT settings FROM users WHERE id = ?`, [userId]);
+        let userAISettings = { provider: 'ollama', model: 'llama3', temperature: 0.7, maxTokens: 2048 };
+        if (userSettingsRow && userSettingsRow.settings) {
+            try {
+                const parsedSettings = JSON.parse(userSettingsRow.settings);
+                if (parsedSettings.ai) {
+                    userAISettings = { ...userAISettings, ...parsedSettings.ai };
+                }
+            } catch (parseError) {
+                logger.warn(`[Backend] Failed to parse user settings for ${userId}:`, parseError);
+            }
+        }
+        logger.info(`[Backend] User AI Settings for insights:`, userAISettings);
+
+        // 2. Define a generic LLM client function to pass to agents
+        const llmClient = async (promptToCall, config) => {
+            const { provider, model, temperature, maxTokens } = config; // Use config passed to llmClient
+
+            if (provider === 'ollama') {
+                const ollamaUrl = process.env.OLLAMA_API_URL || 'http://localhost:11434/api/generate';
+                const ollamaPayload = {
+                    model: model,
+                    prompt: promptToCall,
+                    stream: false,
+                    options: {
+                        temperature: temperature,
+                        num_predict: maxTokens
+                    }
+                };
+                const ollamaFetchResponse = await fetch(ollamaUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(ollamaPayload)
+                });
+                if (!ollamaFetchResponse.ok) {
+                    const errorText = await ollamaFetchResponse.text();
+                    throw new Error(`Ollama API error: ${ollamaFetchResponse.statusText}. Response: ${errorText}`);
+                }
+                const llmResponse = await ollamaFetchResponse.json();
+                const rawText = typeof llmResponse?.response === 'string' ? llmResponse.response.trim() : '';
+                if (!rawText) {
+                    throw new Error('Ollama returned empty response.');
+                }
+                return cleanAndParseJson(rawText); // Use your existing JSON cleaner
+            } else if (provider === 'gemini') {
+                const geminiModel = model || 'gemini-2.0-flash';
+                const chatHistory = [];
+                chatHistory.push({ role: "user", parts: [{ text: promptToCall }] });
+                const payload = {
+                    contents: chatHistory,
+                    generationConfig: {
+                        responseMimeType: "application/json", // Request JSON directly
+                        responseSchema: { // Provide a generic schema for array of objects
+                            type: "ARRAY",
+                            items: {
+                                type: "OBJECT",
+                                properties: {
+                                    // These properties will be filled by the LLM based on prompt
+                                    "type": { "type": "STRING" },
+                                    "title": { "type": "STRING" },
+                                    "description": { "type": "STRING" },
+                                    "recommendation": { "type": "STRING" },
+                                    "rationale": { "type": "STRING" },
+                                    "urgency": { "type": "STRING" },
+                                    "category": { "type": "STRING" }
+                                }
+                            }
+                        },
+                        temperature: temperature || 0.7,
+                        maxOutputTokens: maxTokens || 1024
+                    }
+                };
+                const apiKey = ""; // Canvas will provide this at runtime
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
+                const geminiFetchResponse = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (!geminiFetchResponse.ok) {
+                    const errorText = await geminiFetchResponse.text();
+                    throw new Error(`Gemini API error: ${geminiFetchResponse.statusText}. Response: ${errorText}`);
+                }
+                const llmResponse = await geminiFetchResponse.json();
+                if (llmResponse.candidates && llmResponse.candidates.length > 0 &&
+                    llmResponse.candidates[0].content && llmResponse.candidates[0].content.parts &&
+                    llmResponse.candidates[0].content.parts.length > 0) {
+                    const jsonString = llmResponse.candidates[0].content.parts[0].text;
+                    return JSON.parse(jsonString);
+                } else {
+                    throw new Error('Gemini response had no candidates or content.');
+                }
+            } else {
+                throw new Error(`Unsupported AI provider: ${provider}.`);
+            }
+        };
+
+        // 3. Fetch aggregated business data for the Insight Generator
+        const businessData = await getAggregatedBusinessData(userId, period);
+
+        // 4. Fetch operational analytics data (reusing existing logic)
+        // Processing Trends
+        let groupBy = 'strftime(\'%Y-%m-%d\', created_at)';
+        let dateFilterTrends = 'datetime(\'now\', \'-7 days\')';
+        if (period === '30days') {
+          dateFilterTrends = 'datetime(\'now\', \'-30 days\')';
+        } else if (period === '6months') {
+          groupBy = 'strftime(\'%Y-%m\', created_at)';
+          dateFilterTrends = 'datetime(\'now\', \'-6 months\')';
+        } else if (period === '12months') {
+          groupBy = 'strftime(\'%Y-%m\', created_at)';
+          dateFilterTrends = 'datetime(\'now\', \'-12 months\')';
+        }
+
+        const trends = await db.all(`
+          SELECT
+            ${groupBy} as period,
+            COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
+            COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
+          FROM workflows
+          WHERE user_id = ? AND created_at >= ${dateFilterTrends}
+          GROUP BY period
+          ORDER BY period ASC
+        `, [userId]);
+
+        // Data Quality Distribution (and totals)
+        let dateFilterQuality = 'datetime(\'now\', \'-30 days\')';
+        if (period === '7days') {
+          dateFilterQuality = 'datetime(\'now\', \'-7 days\')';
+        } else if (period === '6months') {
+          dateFilterQuality = 'datetime(\'now\', \'-6 months\')';
+        } else if (period === '12months') {
+          dateFilterQuality = 'datetime(\'now\', \'-12 months\')';
+        }
+
+        const qualityResults = await db.all(`
+          SELECT task_id, output, error, metrics, wr.status AS task_status
+          FROM workflow_results wr
+          JOIN workflows w ON wr.workflow_id = w.id
+          WHERE w.user_id = ? AND wr.completed_at >= ${dateFilterQuality}
+          AND wr.status = 'completed'
+        `, [userId]);
+
+        const errorTypeCounts = {};
+        const totalCompletedTasks = qualityResults.length;
+        let totalErrorsFound = 0;
+        let totalRecordsProcessed = 0;
+
+        qualityResults.forEach(result => {
+          try {
+            const metrics = JSON.parse(result.metrics || '{}');
+            const output = JSON.parse(result.output || '{}');
+
+            if (typeof metrics.recordsProcessed === 'number') {
+                totalRecordsProcessed += metrics.recordsProcessed;
+            } else if (output.metadata && typeof output.metadata.rowCount === 'number') {
+                totalRecordsProcessed += output.metadata.rowCount;
+            } else if (Array.isArray(output)) {
+                totalRecordsProcessed += output.reduce((sum, item) => sum + (item.metadata?.rowCount || 0), 0);
+            }
+
+            if (Array.isArray(metrics.errorsFound) && metrics.errorsFound.length > 0) {
+                totalErrorsFound += metrics.errorsFound.length;
+                metrics.errorsFound.forEach(errorString => {
+                    let errorCategory = 'Other';
+                    const lowerError = errorString.toLowerCase();
+                    if (lowerError.includes('missing') || lowerError.includes('empty') || lowerError.includes('null')) {
+                        errorCategory = 'Missing Data';
+                    } else if (lowerError.includes('duplicate')) {
+                        errorCategory = 'Duplicates';
+                    } else if (lowerError.includes('date') || lowerError.includes('format')) {
+                        errorCategory = 'Formatting Issues';
+                    } else if (lowerError.includes('outlier') || lowerError.includes('range')) {
+                        errorCategory = 'Outliers/Range';
+                    } else if (lowerError.includes('schema') || lowerError.includes('header') || lowerError.includes('inconsistent')) {
+                        errorCategory = 'Schema Inconsistency';
+                    } else if (lowerError.includes('invalid') || lowerError.includes('violation')) {
+                        errorCategory = 'Validation Errors';
+                    }
+                    errorTypeCounts[errorCategory] = (errorTypeCounts[errorCategory] || 0) + 1;
+                });
+            }
+          } catch (parseError) {
+            logger.warn('Failed to parse workflow_results output/metrics for insight generation:', parseError);
+          }
+        });
+
+        const errorDistribution = Object.entries(errorTypeCounts).map(([label, count]) => ({
+            name: label,
+            value: totalErrorsFound > 0 ? (count / totalErrorsFound) * 100 : 0
+        }));
+
+        const operationalAnalyticsDataForLLM = {
+            totalCompletedTasks,
+            totalRecordsProcessed,
+            totalErrorsFound,
+            errorDistribution,
+            processingTrends: trends
+        };
+
+
+        // 5. Call the Insight Generator Agent with both business and operational data
+        const combinedDataForInsightAgent = {
+            ...businessData, // Product, Region, Sales Trends
+            errorDistribution: operationalAnalyticsDataForLLM.errorDistribution // Error anomalies
+        };
+        const generatedInsights = await generateBusinessInsights(callLLM, combinedDataForInsightAgent, userAISettings);
+
+        // 6. Call the Decision Advisor Agent with the generated insights
+        const generatedDecisions = await adviseOnDecisions(callLLM, generatedInsights, userAISettings);
+
+        // 7. Return both insights and decisions to the frontend
+        res.json({
+            insights: generatedInsights,
+            decisions: generatedDecisions
+        });
+
+    } catch (error) {
+        logger.error('[Backend] Error generating AI insights or decisions:', error);
+        res.status(500).json({ message: 'Failed to generate AI insights or decisions', error: error.message });
+    }
 });
 
 export default router;

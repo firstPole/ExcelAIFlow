@@ -17,11 +17,17 @@ import {
   CheckCircle,
   AlertCircle,
   Clock,
-  X // For close button in modals
+  X, // For close button in modals
+  Bug, // New icon for errors
+  Loader2,
+  Bot,
+  Lightbulb, // For insights
+  Megaphone // For decisions/recommendations
 } from 'lucide-react';
 import { useWorkflow } from '@/contexts/workflow-context';
 import { ResponsiveContainer, LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, BarChart, Bar, Legend } from 'recharts';
-import { WorkflowService } from '@/services/workflow.service'; // Import WorkflowService
+import { WorkflowService, AiInsight, DecisionRecommendation } from '@/services/workflow.service';
+import { toast } from 'sonner'; // Import toast for notifications
 
 // Define the type for the processed workflow results to be displayed in the main list
 interface WorkflowResultDisplay {
@@ -35,6 +41,8 @@ interface WorkflowResultDisplay {
   errorCount: number; // issuesFound from report output
   description: string;
   actualOutput: any; // The full parsed output of the last executed task (e.g., the report object)
+  // New property to store the raw error details if available
+  errorDetails?: string[] | null;
 }
 
 // Define the structure for the Report task's output
@@ -81,25 +89,6 @@ interface TabularOutput {
     validRecordsCount?: number;
     invalidRecordsCount?: number;
 }
-
-
-// Mock data for Analytics/Insights - these tabs are not directly fed by the single workflow result
-// and would typically require aggregated data from a separate backend analytics service.
-const mockChartData = [
-  { name: 'Jan', value: 400, errors: 12 },
-  { name: 'Feb', value: 300, errors: 8 },
-  { name: 'Mar', value: 200, errors: 5 },
-  { name: 'Apr', value: 278, errors: 15 },
-  { name: 'May', value: 189, errors: 3 },
-  { name: 'Jun', value: 239, errors: 7 }
-];
-
-const mockPieData = [
-  { name: 'Clean', value: 400, color: '#0088FE' },
-  { name: 'Errors', value: 300, color: '#00C49F' },
-  { name: 'Duplicates', value: 200, color: '#FFBB28' },
-  { name: 'Missing', value: 100, color: '#FF8042' }
-];
 
 // --- Modal Components ---
 
@@ -310,6 +299,46 @@ const ReportModal: React.FC<ReportModalProps> = ({ isOpen, onClose, reportData }
   );
 };
 
+interface ErrorDetailsModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  errors: string[];
+}
+
+const ErrorDetailsModal: React.FC<ErrorDetailsModalProps> = ({ isOpen, onClose, errors }) => {
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
+      <Card className="max-w-xl w-full max-h-[90vh] flex flex-col">
+        <CardHeader className="flex flex-row items-center justify-between pb-2">
+          <CardTitle className="text-xl flex items-center">
+            <Bug className="h-5 w-5 mr-2 text-red-500" />
+            Workflow Errors
+          </CardTitle>
+          <Button variant="ghost" size="icon" onClick={onClose} className="text-gray-500 hover:text-gray-800">
+            <X className="h-5 w-5" />
+          </Button>
+        </CardHeader>
+        <CardContent className="flex-grow overflow-y-auto">
+          {errors.length > 0 ? (
+            <ul className="list-disc pl-5 space-y-2 text-sm text-red-700">
+              {errors.map((error, index) => (
+                <li key={index} className="bg-red-50 p-2 rounded-md border border-red-200">
+                  {error}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-sm text-gray-500 text-center py-8">No detailed error messages available.</p>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+};
+
+
 // --- Main Results Component ---
 
 export default function Results() {
@@ -322,9 +351,22 @@ export default function Results() {
   // State for modals
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
+  const [isErrorDetailsModalOpen, setIsErrorDetailsModalOpen] = useState(false); // New state for error modal
   const [selectedWorkflowOutput, setSelectedWorkflowOutput] = useState<any>(null);
+  const [selectedErrorDetails, setSelectedErrorDetails] = useState<string[] | null>(null); // New state for error details
+  
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  
+  // --- UPDATED STATE FOR ANALYTICS AND INSIGHTS DATA ---
+  const [processingTrends, setProcessingTrends] = useState<Array<{ period: string; completed: number; failed: number }>>([]);
+  const [dataQualityDistribution, setDataQualityDistribution] = useState<Array<{ name: string; value: number }>>([]);
+  const [aiInsights, setAiInsights] = useState<AiInsight[]>([]); // Now uses the updated AiInsight interface
+  const [decisionRecommendations, setDecisionRecommendations] = useState<DecisionRecommendation[]>([]); // New state for decisions
+  const [analyticsPeriod, setAnalyticsPeriod] = useState('30days'); // Default period for analytics
+  const [isLoadingAnalytics, setIsLoadingAnalytics] = useState(true); // Loading state for all analytics/insights/decisions
+
 
   useEffect(() => {
     // --- START NEW LOGS ---
@@ -354,9 +396,10 @@ export default function Results() {
 
             // resultsData will be an array of objects from workflow_results table
             // We usually care about the LATEST result for a given workflow for display
+            // Find the latest completed task result
             const latestResult = resultsData
                 .sort((a: any, b: any) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-                .find((r: any) => r.status === 'completed'); // Get the latest completed task result
+                .find((r: any) => r.status === 'completed');
 
             // --- START NEW LOGS ---
             console.log(`Frontend Debug: Latest completed result for workflow ${workflow.id}:`, latestResult);
@@ -377,40 +420,81 @@ export default function Results() {
                 let recordCount = 0;
                 let errorCount = 0;
                 let resultType = 'unknown';
+                let errorDetails: string[] = []; // Initialize error details array
 
                 if (parsedOutput) {
                     if (parsedOutput.reportGenerated) { // This is the output from the 'report' task
                         recordCount = parsedOutput.totalProcessedRecords || 0;
                         errorCount = parsedOutput.metadata?.issuesFound || 0;
                         resultType = 'report';
+                        if (parsedOutput.reportIssues && Array.isArray(parsedOutput.reportIssues)) {
+                            errorDetails = parsedOutput.reportIssues;
+                        }
                     } else if (parsedOutput.metadata?.merged) { // Output from 'merge' task
                         recordCount = parsedOutput.metadata.rowCount || 0;
                         errorCount = parsedOutput.metadata.issuesFound || 0;
                         resultType = 'merged_data';
+                        if (parsedOutput.mergeIssues && Array.isArray(parsedOutput.mergeIssues)) {
+                            errorDetails = parsedOutput.mergeIssues;
+                        }
                     } else if (Array.isArray(parsedOutput)) { // Output from 'analyze' or 'clean' tasks (array of file data)
                         recordCount = parsedOutput.reduce((sum: number, fileData: any) => sum + (fileData.metadata?.rowCount || 0), 0);
                         errorCount = parsedOutput.reduce((sum: number, fileData: any) => sum + (fileData.metadata?.issuesFound || 0), 0);
-                        if (parsedOutput[0]?.metadata?.analyzed) resultType = 'analyze_data';
-                        else if (parsedOutput[0]?.metadata?.cleaned) resultType = 'cleaned_data';
+                        if (parsedOutput[0]?.metadata?.analyzed) {
+                            resultType = 'analyze_data';
+                            errorDetails = parsedOutput.flatMap((item: any) => item.analysisIssues || []);
+                        }
+                        else if (parsedOutput[0]?.metadata?.cleaned) {
+                            resultType = 'cleaned_data';
+                            errorDetails = parsedOutput.flatMap((item: any) => item.cleaningReport?.details || []);
+                        }
                         else resultType = 'unknown_array_data';
                     } else if (parsedOutput.metadata?.validated) { // Output from 'validate' task
                         recordCount = parsedOutput.validRecordsCount || 0;
                         errorCount = parsedOutput.invalidRecordsCount || 0;
                         resultType = 'validated_data';
+                        if (parsedOutput.validationIssues && Array.isArray(parsedOutput.validationIssues)) {
+                            errorDetails = parsedOutput.validationIssues.flatMap((issue: any) => issue.issues || []);
+                        }
                     } else if (parsedOutput.metadata?.analyzed) { // Output from 'analyze' task (single file)
                         recordCount = parsedOutput.metadata.rowCount || 0;
                         errorCount = parsedOutput.metadata.issuesFound || 0;
                         resultType = 'analyze_data';
+                        if (parsedOutput.analysisIssues && Array.isArray(parsedOutput.analysisIssues)) {
+                            errorDetails = parsedOutput.analysisIssues;
+                        }
                     } else if (parsedOutput.metadata?.cleaned) { // Output from 'clean' task (single file)
                         recordCount = parsedOutput.metadata.rowCount || 0;
                         errorCount = parsedOutput.metadata.issuesFound || 0;
                         resultType = 'cleaned_data';
+                        if (parsedOutput.cleaningReport?.details && Array.isArray(parsedOutput.cleaningReport.details)) {
+                            errorDetails = parsedOutput.cleaningReport.details;
+                        }
                     } else if (parsedOutput.message) { // Generic message output
                         recordCount = 0;
                         errorCount = 0;
                         resultType = 'message';
                     }
                 }
+
+                // Also check the 'error' field from the workflow_results table directly
+                // Ensure latestResult.error is an array before concatenating
+                if (latestResult.error && Array.isArray(latestResult.error)) {
+                    errorDetails = errorDetails.concat(latestResult.error);
+                } else if (latestResult.error && typeof latestResult.error === 'string') {
+                    // If it's a string, try to parse it as JSON
+                    try {
+                        const parsedRawError = JSON.parse(latestResult.error);
+                        if (Array.isArray(parsedRawError)) {
+                            errorDetails = errorDetails.concat(parsedRawError);
+                        } else if (typeof parsedRawError === 'string') {
+                            errorDetails.push(parsedRawError); // Add as a single string error
+                        }
+                    } catch (parseErr) {
+                        errorDetails.push(`Raw error (unparseable): ${latestResult.error}`);
+                    }
+                }
+
 
                 const newResultEntry = {
                     id: workflow.id, // Still use workflow ID as the primary ID for the display item
@@ -422,7 +506,8 @@ export default function Results() {
                     recordCount: recordCount,
                     errorCount: errorCount,
                     description: workflow.description,
-                    actualOutput: parsedOutput // Store the parsed output for modals
+                    actualOutput: parsedOutput, // Store the parsed output for modals
+                    errorDetails: errorDetails.length > 0 ? errorDetails : null // Store collected error details
                 };
 
                 // --- START NEW LOGS ---
@@ -455,7 +540,43 @@ export default function Results() {
     }
   }, [workflows]); // Re-run when the list of workflows changes
 
+  // --- NEW useEffect for fetching analytics data ---
+// --- UPDATED useEffect for fetching analytics data, insights, AND decisions ---
+useEffect(() => {
+  const fetchAllAnalyticsData = async () => {
+    setIsLoadingAnalytics(true); // Start loading for all analytics tabs
 
+    try {
+      // Fetch Processing Trends
+      const trends = await WorkflowService.getProcessingTrends(analyticsPeriod);
+      setProcessingTrends(trends);
+
+      // Fetch Data Quality Distribution
+      const qualityData = await WorkflowService.getDataQualityDistribution(analyticsPeriod);
+      setDataQualityDistribution(qualityData.errorDistribution);
+
+      // Fetch AI Insights and Decisions using the new consolidated service method
+      const { insights, decisions } = await WorkflowService.getAiInsightsAndDecisions(analyticsPeriod);
+
+      // Update states
+      setAiInsights(insights);
+      setDecisionRecommendations(decisions);
+
+      toast.success('Analytics data, insights, and decisions refreshed!');
+    } catch (error: any) {
+      console.error('Error fetching analytics data, insights, or decisions:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred.';
+      toast.error(`Error fetching analytics data: ${errorMessage}`);
+      // On error, clear previous insights/decisions to avoid showing stale data
+      setAiInsights([]);
+      setDecisionRecommendations([]);
+    } finally {
+      setIsLoadingAnalytics(false); // End loading for all analytics tabs
+    }
+  };
+
+  fetchAllAnalyticsData();
+}, [analyticsPeriod]);
   const filteredResults = actualResults.filter(result => {
     const matchesSearch = result.workflowName.toLowerCase().includes(searchTerm.toLowerCase()) ||
                           result.description.toLowerCase().includes(searchTerm.toLowerCase());
@@ -528,8 +649,8 @@ export default function Results() {
     if (output.headers && Array.isArray(output.rows)) {
         const csvRows = [output.headers.join(',')];
         output.rows.forEach((row: any[]) => {
+            // Basic CSV escaping for cells containing commas or newlines
             csvRows.push(row.map(cell => {
-                // Basic CSV escaping for cells containing commas or newlines
                 const stringCell = String(cell);
                 return (stringCell.includes(',') || stringCell.includes('\n') || stringCell.includes('"')) ? `"${stringCell.replace(/"/g, '""')}"` : stringCell;
             }).join(','));
@@ -580,6 +701,16 @@ export default function Results() {
   const handleViewReport = (output: any) => {
     setSelectedWorkflowOutput(output);
     setIsReportModalOpen(true);
+  };
+
+  // New handler for viewing errors
+  const handleViewErrors = (errors: string[] | null) => {
+    if (errors && errors.length > 0) {
+      setSelectedErrorDetails(errors);
+      setIsErrorDetailsModalOpen(true);
+    } else {
+      toast.info("No detailed errors available for this workflow result.");
+    }
   };
   // --- End Button Handlers ---
 
@@ -711,6 +842,11 @@ export default function Results() {
                       <div>
                         <p className="text-sm text-muted-foreground">Errors</p>
                         <p className="font-medium text-red-600">{result.errorCount}</p>
+                        {result.errorCount > 0 && result.errorDetails && (
+                            <Button variant="link" size="sm" className="text-red-500 p-0 h-auto" onClick={() => handleViewErrors(result.errorDetails)}>
+                                <Bug className="h-3 w-3 mr-1" /> View Details
+                            </Button>
+                        )}
                       </div>
                       <div>
                         <p className="text-sm text-muted-foreground">Created</p>
@@ -742,93 +878,177 @@ export default function Results() {
         </TabsContent>
 
         <TabsContent value="analytics" className="space-y-4">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <Card>
-              <CardHeader>
-                <CardTitle>Processing Trends</CardTitle>
-                <CardDescription>Monthly workflow completion rates</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={mockChartData}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis dataKey="name" />
-                    <YAxis />
-                    <Tooltip />
-                    <Legend />
-                    <Line type="monotone" dataKey="value" stroke="#8884d8" name="Workflows Completed" />
-                    <Line type="monotone" dataKey="errors" stroke="#82ca9d" name="Errors Found" />
-                  </LineChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
+          <Card>
+            <CardHeader>
+              <CardTitle>Analytics Period</CardTitle>
+              <CardDescription>Select the time period for analytics data.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Select value={analyticsPeriod} onValueChange={setAnalyticsPeriod}>
+                <SelectTrigger className="w-48">
+                  <SelectValue placeholder="Select period" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="7days">Last 7 Days</SelectItem>
+                  <SelectItem value="30days">Last 30 Days</SelectItem>
+                  <SelectItem value="6months">Last 6 Months</SelectItem>
+                  <SelectItem value="12months">Last 12 Months</SelectItem>
+                </SelectContent>
+              </Select>
+              {isLoadingAnalytics ? (
+                <div className="flex flex-col items-center justify-center h-64">
+                  <Loader2 className="h-10 w-10 animate-spin text-primary mb-4" />
+                  <p className="text-lg text-muted-foreground">Loading Analytics Data...</p>
+                  <p className="text-sm text-muted-foreground mt-1">Fetching processing trends and quality distribution.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>Processing Trends</CardTitle>
+                        <CardDescription>Workflow completion rates over time</CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        {processingTrends.length > 0 ? (
+                          <ResponsiveContainer width="100%" height={300}>
+                            <LineChart data={processingTrends}>
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis dataKey="period" />
+                              <YAxis />
+                              <Tooltip />
+                              <Legend />
+                              <Line type="monotone" dataKey="completed" stroke="#82ca9d" name="Workflows Completed" />
+                              <Line type="monotone" dataKey="failed" stroke="#ff7300" name="Workflows Failed" />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <p className="text-center text-muted-foreground py-8">No data available for processing trends in this period.</p>
+                        )}
+                      </CardContent>
+                    </Card>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>Data Quality Distribution</CardTitle>
-                <CardDescription>Breakdown of data processing results</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <ResponsiveContainer width="100%" height={300}>
-                  <PieChart>
-                    <Pie
-                      data={mockPieData}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
-                      outerRadius={80}
-                      fill="#8884d8"
-                      dataKey="value"
-                    >
-                      {mockPieData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={entry.color} />
-                      ))}
-                    </Pie>
-                    <Tooltip />
-                    <Legend />
-                  </PieChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
-          </div>
+                    <Card>
+                      <CardHeader>
+                        <CardTitle>Data Quality Distribution</CardTitle>
+                        <CardDescription>Breakdown of errors found in processed data</CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        {dataQualityDistribution.length > 0 ? (
+                          <ResponsiveContainer width="100%" height={300}>
+                            <PieChart>
+                              <Pie
+                                data={dataQualityDistribution}
+                                cx="50%"
+                                cy="50%"
+                                labelLine={false}
+                                label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                                outerRadius={80}
+                                fill="#8884d8"
+                                dataKey="value"
+                              >
+                                {dataQualityDistribution.map((entry, index) => (
+                                  <Cell key={`cell-${index}`} fill={['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#A28DFF', '#FF6B6B'][index % 6]} />
+                                ))}
+                              </Pie>
+                              <Tooltip />
+                              <Legend />
+                            </PieChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <p className="text-center text-muted-foreground py-8">No data available for quality distribution in this period.</p>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </div>
+                </>
+              )}
+            </CardContent>
+          </Card>
         </TabsContent>
 
+
+{/* Insights Tab Content (UPDATED) */}
         <TabsContent value="insights" className="space-y-4">
-          <div className="grid gap-4">
-            <Card>
-              <CardHeader>
-                <CardTitle>Key Insights</CardTitle>
-                <CardDescription>AI-generated insights from your data processing</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="border-l-4 border-blue-500 pl-4">
-                  <h4 className="font-semibold">Data Quality Improvement</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Your data cleaning workflows have improved data quality by 85% over the past month,
-                    with duplicate removal being the most effective process.
-                  </p>
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center">
+                <Lightbulb className="mr-2 h-5 w-5 text-yellow-500" />
+                Key AI-Generated Insights
+              </CardTitle>
+              <CardDescription>Actionable findings extracted from your business data.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {isLoadingAnalytics ? ( // Use isLoadingAnalytics for insights too
+                <div className="flex flex-col items-center justify-center h-64">
+                  <Loader2 className="h-10 w-10 animate-spin text-primary mb-4" />
+                  <p className="text-lg text-muted-foreground">Generating AI Insights...</p>
+                  <p className="text-sm text-muted-foreground mt-1">This may take a moment as the AI model processes your data.</p>
                 </div>
-
-                <div className="border-l-4 border-green-500 pl-4">
-                  <h4 className="font-semibold">Processing Efficiency</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Average workflow completion time has decreased by 40% through optimized agent
-                    coordination and task parallelization.
-                  </p>
-                </div>
-
-                <div className="border-l-4 border-orange-500 pl-4">
-                  <h4 className="font-semibold">Error Pattern Analysis</h4>
-                  <p className="text-sm text-muted-foreground">
-                    Most common errors are related to date formatting (45%) and missing required fields (30%).
-                    Consider implementing stricter validation rules.
-                  </p>
-                </div>
-              </CardContent>
-            </Card>
-          </div>
+              ) : aiInsights.length > 0 ? (
+                aiInsights.map((insight, index) => (
+                  <div key={index} className="border-l-4 border-blue-500 pl-4 py-2">
+                    <h4 className="font-semibold text-lg">{insight.title}</h4>
+                    <p className="text-sm text-muted-foreground">{insight.description}</p>
+                    {insight.data && ( // Optionally display structured data if available
+                        <pre className="mt-2 text-xs text-muted-foreground bg-gray-50 p-2 rounded-md overflow-auto">
+                            {JSON.stringify(insight.data, null, 2)}
+                        </pre>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <p className="text-center text-muted-foreground py-8">No AI insights generated for this period.</p>
+              )}
+            </CardContent>
+          </Card>
         </TabsContent>
+
+        {/* NEW Decisions Tab Content */}
+        <TabsContent value="decisions" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center">
+                <Megaphone className="mr-2 h-5 w-5 text-green-500" />
+                AI-Suggested Decisions
+              </CardTitle>
+              <CardDescription>Actionable recommendations based on the generated insights.</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {isLoadingAnalytics ? ( // Use isLoadingAnalytics for decisions too
+                <div className="flex flex-col items-center justify-center h-64">
+                  <Loader2 className="h-10 w-10 animate-spin text-primary mb-4" />
+                  <p className="text-lg text-muted-foreground">Generating Decision Recommendations...</p>
+                  <p className="text-sm text-muted-foreground mt-1">The AI is formulating strategic actions.</p>
+                </div>
+              ) : decisionRecommendations.length > 0 ? (
+                decisionRecommendations.map((decision, index) => (
+                  <div key={index} className={`border-l-4 pl-4 py-2 ${
+                    decision.urgency === 'high' ? 'border-red-500' :
+                    decision.urgency === 'medium' ? 'border-orange-500' :
+                    'border-green-500'
+                  }`}>
+                    <h4 className="font-semibold text-lg flex items-center">
+                      <Badge variant="outline" className={`mr-2 capitalize ${
+                        decision.urgency === 'high' ? 'text-red-600 border-red-300' :
+                        decision.urgency === 'medium' ? 'text-orange-600 border-orange-300' :
+                        'text-green-600 border-green-300'
+                      }`}>
+                        {decision.urgency} Urgency
+                      </Badge>
+                      {decision.recommendation}
+                    </h4>
+                    <p className="text-sm text-muted-foreground mt-1">{decision.rationale}</p>
+                    <p className="text-xs text-gray-500 mt-1">Category: <Badge variant="secondary" className="capitalize">{decision.category.replace(/_/g, ' ')}</Badge></p>
+                  </div>
+                ))
+              ) : (
+                <p className="text-center text-muted-foreground py-8">No AI-suggested decisions for this period.</p>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+
       </Tabs>
 
       {/* Modals */}
@@ -845,6 +1065,14 @@ export default function Results() {
           isOpen={isPreviewModalOpen}
           onClose={() => setIsPreviewModalOpen(false)}
           data={selectedWorkflowOutput as TabularOutput} // Cast to TabularOutput type
+        />
+      )}
+
+      {isErrorDetailsModalOpen && selectedErrorDetails && ( // New Error Details Modal
+        <ErrorDetailsModal
+          isOpen={isErrorDetailsModalOpen}
+          onClose={() => setIsErrorDetailsModalOpen(false)}
+          errors={selectedErrorDetails}
         />
       )}
     </div>

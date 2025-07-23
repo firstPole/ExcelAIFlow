@@ -220,8 +220,8 @@ export default function Dashboard() {
                       <div>
                         <p className="font-medium">{workflow.name}</p>
                         <p className="text-sm text-muted-foreground">
-                          {workflow.tasks.length} tasks • {workflow.files.length} files
-                        </p>
+  {workflow.tasks?.length ?? 0} tasks • {workflow.fileIds?.length ?? 0} files
+</p>
                       </div>
                     </div>
                     <div className="flex items-center space-x-2">

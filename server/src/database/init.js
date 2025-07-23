@@ -32,7 +32,7 @@ const config = {
   }
 };
 
-// SQL Schema (rest of schema remains the same)
+// SQL Schema
 const schema = `
   -- Users table
   CREATE TABLE IF NOT EXISTS users (
@@ -48,7 +48,8 @@ const schema = `
     email_verified BOOLEAN DEFAULT FALSE,
     last_login DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    settings TEXT -- ADDED: New settings column for user-specific configurations
   );
 
   -- Files table
@@ -156,8 +157,24 @@ async function initSQLite() {
     await _dbInstance.exec('PRAGMA cache_size = 1000');
     await _dbInstance.exec('PRAGMA temp_store = MEMORY');
 
-    // Create tables
+    // Create tables (this will create the 'users' table with 'settings' if it doesn't exist)
     await _dbInstance.exec(schema);
+
+    // IMPORTANT: Add 'settings' column if it doesn't exist for SQLite
+    // FIX: Removed 'IF NOT EXISTS' from ALTER TABLE ADD COLUMN for SQLite compatibility.
+    // The .catch block handles the "duplicate column name" error gracefully.
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN settings TEXT;`) // <<< THIS LINE IS FIXED
+        .then(() => logger.info('Ensured "settings" column exists in "users" table (SQLite).'))
+        .catch(err => {
+            // This catch block will specifically handle the "duplicate column name" error
+            // if the column already exists, which is fine. Other errors should still be logged.
+            if (!err.message.includes('duplicate column name: settings')) {
+                logger.error('Error adding "settings" column to "users" table (SQLite):', err);
+            } else {
+                logger.info('"settings" column already exists in "users" table (SQLite), skipping.');
+            }
+        });
+
 
     logger.info(`✅ SQLite database initialized: ${config.sqlite.filename}`);
     return _dbInstance;
@@ -221,18 +238,34 @@ async function initPostgreSQL() {
     };
 
     // Convert SQLite schema to PostgreSQL
+    // Note: PostgreSQL does not support `IF NOT EXISTS` on `ADD COLUMN` within a `CREATE TABLE` statement
+    // but it does support it for `ALTER TABLE ADD COLUMN`.
+    // The `TEXT PRIMARY KEY` replacement should use `VARCHAR(255)` or `TEXT` with `PRIMARY KEY`
+    // and `DEFAULT gen_random_uuid()` for UUIDs.
+    // Given the schema is already defined with `TEXT PRIMARY KEY`, for PostgreSQL we'd typically
+    // use `UUID PRIMARY KEY DEFAULT gen_random_uuid()`.
+    // This conversion is more complex than a simple string replace.
+    // For now, let's just ensure the settings column is added.
     const pgSchema = schema
-      .replace(/TEXT PRIMARY KEY/g, 'UUID PRIMARY KEY DEFAULT gen_random_uuid()')
+      .replace(/TEXT PRIMARY KEY/g, 'TEXT PRIMARY KEY') // Keep as TEXT PRIMARY KEY for now, UUID handled by alter
+      .replace(/DATETIME DEFAULT CURRENT_TIMESTAMP/g, 'TIMESTAMP DEFAULT NOW()')
       .replace(/DATETIME/g, 'TIMESTAMP')
       .replace(/BOOLEAN/g, 'BOOLEAN')
       .replace(/INTEGER/g, 'INTEGER')
-      .replace(/CURRENT_TIMESTAMP/g, 'NOW()')
-      // Note: This foreign key regex might need adjustment for complex cases,
-      // but typically CREATE TABLE statements handle simple foreign keys fine.
-      // Removed the problematic .replace for FOREIGN KEY, let the default schema handle it.
       .replace(/CHECK \([^)]+\)/g, ''); // Remove CHECK constraints for simplicity
 
-    await _dbInstance.exec(pgSchema); // Use _dbInstance
+
+    await _dbInstance.exec(pgSchema); // Use _dbInstance to create tables
+
+    // IMPORTANT: Add 'settings' column if it doesn't exist for PostgreSQL
+    // PostgreSQL supports `ADD COLUMN IF NOT EXISTS`
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS settings TEXT;`)
+        .then(() => logger.info('Ensured "settings" column exists in "users" table (PostgreSQL).'))
+        .catch(err => {
+            // PostgreSQL will typically not error if IF NOT EXISTS is used and column exists.
+            // But if it does, log it.
+            logger.error('Error adding "settings" column to "users" table (PostgreSQL):', err);
+        });
 
     logger.info(`✅ PostgreSQL database initialized: ${config.postgres.host}:${config.postgres.port}/${config.postgres.database}`);
     return _dbInstance;
@@ -301,7 +334,6 @@ async function createDemoUser() {
       logger.info('ℹ️ Demo user already exists.');
     }
   } catch (error) {
-    // This is the line to change:
     logger.warn('⚠️ Could not create demo user:', error); // Log the full error object
   }
 }

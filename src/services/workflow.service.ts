@@ -49,7 +49,28 @@ export interface CreateWorkflowDto {
   tasks: CreateTaskDto[]; // Use the DTO for tasks
   files?: ProcessedData[]; // Files might be associated during creation
 }
+// Interface for AI Insights
+export interface AiInsight {
+  type: string; // e.g., 'product_performance', 'region_performance', 'sales_trend', 'error_anomaly'
+  title: string;
+  description: string;
+  data?: any; // Optional: structured data supporting the insight
+}
 
+// New Interface for Decision Recommendations
+export interface DecisionRecommendation {
+  recommendation: string;
+  rationale: string;
+  urgency: 'high' | 'medium' | 'low';
+  category: 'marketing' | 'sales' | 'operations' | 'data_quality';
+  insightId?: string; // Optional: link to the insight it's based on
+}
+
+// Interface for the combined response from the new insights endpoint
+export interface AiInsightsAndDecisionsResponse {
+  insights: AiInsight[];
+  decisions: DecisionRecommendation[];
+}
 
 export class WorkflowService {
 
@@ -210,6 +231,79 @@ export class WorkflowService {
       throw new Error(axiosError.response?.data?.message || 'Failed to fetch workflow templates.');
     }
   }
+
+// --- NEW ANALYTICS METHODS ---
+
+  /**
+   * Fetches processing trends data for analytics charts.
+   * @param period The time period (e.g., '7days', '30days', '6months', '12months').
+   * @returns A promise resolving to an array of trend data.
+   */
+  static async getProcessingTrends(period: string = '7days'): Promise<Array<{ period: string; completed: number; failed: number }>> {
+    try {
+      const response = await api.get<Array<{ period: string; completed: number; failed: number }>>(`/api/workflows/analytics/processing-trends`, {
+        params: { period }
+      });
+      return response.data;
+    } catch (error: unknown) {
+      const axiosError = error as AxiosError<{ message?: string }>;
+      throw new Error(axiosError.response?.data?.message || 'Failed to fetch processing trends');
+    }
+  }
+  /**
+   * Fetches data quality distribution data for analytics charts.
+   * @param period The time period (e.g., '7days', '30days', '6months', '12months').
+   * @returns A promise resolving to an object with quality distribution data.
+   */
+  static async getDataQualityDistribution(period: string = '30days'): Promise<{
+    totalCompletedTasks: number;
+    totalRecordsProcessed: number;
+    totalErrorsFound: number;
+    errorDistribution: Array<{ name: string; value: number }>;
+    rawErrorCounts: { [key: string]: number };
+  }> {
+    try {
+      const response = await api.get<any>(`/api/workflows/analytics/quality-distribution`, {
+        params: { period }
+      });
+      return response.data;
+    } catch (error: unknown) {
+      const axiosError = error as AxiosError<{ message?: string }>;
+      throw new Error(axiosError.response?.data?.message || 'Failed to fetch data quality distribution');
+    }
+  }
+
+  /**
+   * Fetches AI-generated insights AND decisions based on analytics data.
+   * @param period The time period for which to generate insights.
+   * @returns A Promise that resolves with an AiInsightsAndDecisionsResponse object.
+   * @throws An error if fetching insights fails.
+   */
+  static async getAiInsightsAndDecisions(period: string): Promise<AiInsightsAndDecisionsResponse> {
+    try {
+      const response = await api.get<AiInsightsAndDecisionsResponse>(`/api/workflows/analytics/insights?period=${period}`);
+      return response.data;
+    } catch (error: unknown) {
+      const axiosError = error as AxiosError<{ message?: string; code?: string }>;
+      throw new Error(axiosError.response?.data?.message || 'Failed to fetch AI insights and decisions.');
+    }
+  }
+
+  //  /**
+  //  * Fetches AI-generated insights based on analytics data.
+  //  * @param period The time period for which to generate insights.
+  //  * @returns A Promise that resolves with an array of AiInsight objects.
+  //  * @throws An error if fetching insights fails.
+  //  */
+  // static async getAiInsights(period: string): Promise<AiInsight[]> {
+  //   try {
+  //     const response = await api.get<AiInsight[]>(`/api/workflows/analytics/insights?period=${period}`);
+  //     return response.data;
+  //   } catch (error: unknown) {
+  //     const axiosError = error as AxiosError<{ message?: string; code?: string }>;
+  //     throw new Error(axiosError.response?.data?.message || 'Failed to fetch AI insights.');
+  //   }
+  // }
 
   /**
    * Saves an existing workflow as a template.
