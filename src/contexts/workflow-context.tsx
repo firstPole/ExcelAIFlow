@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
-import { WorkflowService } from '@/services/workflow.service';
+import { WorkflowService, WorkflowResult } from '@/services/workflow.service'; // Import WorkflowResult from workflow.service
 import { ProcessedData } from '@/lib/file-processor'; // Keep if used elsewhere, not directly used in this snippet
 import { FileService, UploadedFile } from '@/services/file.service'; // Keep if used elsewhere, not directly used in this snippet
 import { toast } from 'sonner';
@@ -27,22 +27,8 @@ export interface Workflow {
   results?: WorkflowResult[];
 }
 
-export interface WorkflowResult {
-  id: string;
-  workflowId: string;
-  taskId: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  output: any; // The processed data/report from the task
-  error: string | null; // Error message if task failed
-  metrics: {
-    recordsProcessed?: number;
-    errorsFound?: string[];
-    [key: string]: any; // Allow other metrics
-  };
-  startedAt?: string;
-  completedAt?: string;
-  createdAt: string;
-}
+// WorkflowResult interface is now imported from workflow.service.ts
+// Removed its definition from here to avoid duplication.
 
 interface WorkflowContextType {
   workflows: Workflow[];
@@ -71,7 +57,8 @@ export function WorkflowProvider({ children }: { children: React.ReactNode }) {
     setIsLoadingWorkflows(true);
     try {
       console.log('[WorkflowContext] Fetching workflows...');
-      const fetchedWorkflows = await WorkflowService.getWorkflows();
+      // Corrected: Use getAllWorkflows as defined in workflow.service.ts
+      const fetchedWorkflows = await WorkflowService.getAllWorkflows();
       setWorkflows(fetchedWorkflows);
       console.log('[WorkflowContext] Fetched workflows:', fetchedWorkflows);
 
@@ -123,7 +110,8 @@ export function WorkflowProvider({ children }: { children: React.ReactNode }) {
     console.log(`[WorkflowContext] Starting polling for workflow: ${workflowId}`);
     pollingIntervals.current[workflowId] = setInterval(async () => {
       try {
-        const updatedWorkflow = await WorkflowService.getWorkflow(workflowId);
+        // Corrected: Use getWorkflowById as defined in workflow.service.ts
+        const updatedWorkflow = await WorkflowService.getWorkflowById(workflowId);
         setWorkflows(prev =>
           prev.map(wf => (wf.id === workflowId ? updatedWorkflow : wf))
         );
@@ -146,14 +134,14 @@ export function WorkflowProvider({ children }: { children: React.ReactNode }) {
           await WorkflowService.updateWorkflow(workflowId, { status: newStatus });
 
           // Fetch the workflow one last time to get the final status from DB
-          const finalWorkflowState = await WorkflowService.getWorkflow(workflowId);
+          const finalWorkflowState = await WorkflowService.getWorkflowById(workflowId); // Corrected method name
           setWorkflows(prev =>
             prev.map(wf => (wf.id === workflowId ? finalWorkflowState : wf))
           );
           if (currentWorkflow && currentWorkflow.id === workflowId) {
             setCurrentWorkflow(finalWorkflowState);
           }
-          
+
           clearInterval(pollingIntervals.current[workflowId]);
           delete pollingIntervals.current[workflowId];
           toast.success(`Workflow "${finalWorkflowState.name}" ${newStatus}!`);
@@ -234,6 +222,7 @@ export function WorkflowProvider({ children }: { children: React.ReactNode }) {
         throw new Error('Workflow not found for adding files.');
       }
       const updatedFileIds = [...new Set([...workflowToUpdate.fileIds, ...newFileIds])]; // Merge and deduplicate
+      // Use WorkflowService.updateWorkflow to persist file changes to the backend
       await WorkflowService.updateWorkflow(workflowId, { fileIds: updatedFileIds });
       updateWorkflow(workflowId, { fileIds: updatedFileIds }); // Update local state
       toast.success('Files added to workflow.');
@@ -250,8 +239,9 @@ export function WorkflowProvider({ children }: { children: React.ReactNode }) {
         throw new Error('Workflow not found to run.');
       }
 
-      // First, update overall workflow status to 'running' on the backend
-      await WorkflowService.runWorkflow(workflowId); // This sets the overall status to 'running'
+      // We remove the direct call to WorkflowService.runWorkflow as it's not defined
+      // in the provided workflow.service.ts. The status will be updated via the polling
+      // mechanism driven by the task executions.
       updateWorkflow(workflowId, { status: 'running' }); // Update local state immediately
 
       startPollingWorkflow(workflowId); // Start polling right after initiating run
@@ -272,18 +262,19 @@ export function WorkflowProvider({ children }: { children: React.ReactNode }) {
 
         console.log(`[WorkflowContext] Executing task "${task.name}" (${task.id}) for workflow ${workflowId}`);
         try {
-          const taskResult = await WorkflowService.executeTask(workflowId, task.id, task.type, currentInputData, {});
-          
+          // Corrected: Use executeWorkflowTask as defined in workflow.service.ts
+          const taskResult = await WorkflowService.executeWorkflowTask(workflowId, task.id, task.type, currentInputData, {});
+
           // Update the local task status and progress
           setWorkflows(prevWorkflows =>
             prevWorkflows.map(wf =>
               wf.id === workflowId
                 ? {
-                    ...wf,
-                    tasks: wf.tasks.map(t =>
-                      t.id === task.id ? { ...t, status: taskResult.taskStatus, progress: taskResult.taskProgress } : t
-                    ),
-                  }
+                  ...wf,
+                  tasks: wf.tasks.map(t =>
+                    t.id === task.id ? { ...t, status: taskResult.taskStatus, progress: taskResult.taskProgress } : t
+                  ),
+                }
                 : wf
             )
           );
@@ -307,11 +298,11 @@ export function WorkflowProvider({ children }: { children: React.ReactNode }) {
             prevWorkflows.map(wf =>
               wf.id === workflowId
                 ? {
-                    ...wf,
-                    tasks: wf.tasks.map(t =>
-                      t.id === task.id ? { ...t, status: 'failed', progress: 0 } : t
-                    ),
-                  }
+                  ...wf,
+                  tasks: wf.tasks.map(t =>
+                    t.id === task.id ? { ...t, status: 'failed', progress: 0 } : t
+                  ),
+                }
                 : wf
             )
           );

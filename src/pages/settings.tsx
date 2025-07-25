@@ -52,7 +52,7 @@ export default function Settings() {
   // Settings states, initialized with defaults or fetched data
   const [userSettings, setUserSettings] = useState<UserSettings>({
     notifications: { email: true, push: true, workflow: true, errors: true },
-    ai: { provider: 'ollama', model: 'llama3', temperature: 0.7, maxTokens: 2048 },
+    ai: { provider: 'ollama', model: 'llama3', temperature: 0.7, maxTokens: 768 },
     database: { type: 'sqlite', host: 'localhost', port: 5432, name: 'excelflow' },
     performance: { maxConcurrentTasks: 5, timeout: 300, retryAttempts: 3 }
   });

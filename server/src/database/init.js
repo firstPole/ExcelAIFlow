@@ -4,12 +4,12 @@ import { open } from 'sqlite';
 import pg from 'pg'; // Keep pg for PostgreSQL support
 import path from 'path';
 import fs from 'fs';
-import { fileURLToPath } from 'url';
+import { fileURLToPath } from 'url'; // Correct import
 import { logger } from '../utils/logger.js';
 import { v4 as uuidv4 } from 'uuid'; // Added for default product owner ID
 import bcrypt from 'bcryptjs'; // Added for password hashing
 
-const __filename = fileURLToPath(import.meta.url);
+const __filename = fileURLToPath(import.meta.url); // Corrected this line
 const __dirname = path.dirname(__filename);
 
 let _dbInstance = null; // Renamed to _dbInstance for clarity
@@ -49,7 +49,9 @@ const schema = `
     last_login DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    settings TEXT -- ADDED: New settings column for user-specific configurations
+    settings TEXT DEFAULT '{}', -- ADDED: New settings column for user-specific configurations
+    profile TEXT DEFAULT '{}', -- ADDED: New profile column for user profile data
+    notification_settings TEXT DEFAULT '{}' -- ADDED: New notification settings column
   );
 
   -- Files table
@@ -157,21 +159,38 @@ async function initSQLite() {
     await _dbInstance.exec('PRAGMA cache_size = 1000');
     await _dbInstance.exec('PRAGMA temp_store = MEMORY');
 
-    // Create tables (this will create the 'users' table with 'settings' if it doesn't exist)
+    // Create tables (this will create the 'users' table with 'settings', 'profile', 'notification_settings' if it doesn't exist)
     await _dbInstance.exec(schema);
 
-    // IMPORTANT: Add 'settings' column if it doesn't exist for SQLite
-    // FIX: Removed 'IF NOT EXISTS' from ALTER TABLE ADD COLUMN for SQLite compatibility.
+    // IMPORTANT: Add 'settings', 'profile', 'notification_settings' columns if they don't exist for SQLite
     // The .catch block handles the "duplicate column name" error gracefully.
-    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN settings TEXT;`) // <<< THIS LINE IS FIXED
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN settings TEXT DEFAULT '{}';`)
         .then(() => logger.info('Ensured "settings" column exists in "users" table (SQLite).'))
         .catch(err => {
-            // This catch block will specifically handle the "duplicate column name" error
-            // if the column already exists, which is fine. Other errors should still be logged.
             if (!err.message.includes('duplicate column name: settings')) {
                 logger.error('Error adding "settings" column to "users" table (SQLite):', err);
             } else {
                 logger.info('"settings" column already exists in "users" table (SQLite), skipping.');
+            }
+        });
+
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN profile TEXT DEFAULT '{}';`)
+        .then(() => logger.info('Ensured "profile" column exists in "users" table (SQLite).'))
+        .catch(err => {
+            if (!err.message.includes('duplicate column name: profile')) {
+                logger.error('Error adding "profile" column to "users" table (SQLite):', err);
+            } else {
+                logger.info('"profile" column already exists in "users" table (SQLite), skipping.');
+            }
+        });
+
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN notification_settings TEXT DEFAULT '{}';`)
+        .then(() => logger.info('Ensured "notification_settings" column exists in "users" table (SQLite).'))
+        .catch(err => {
+            if (!err.message.includes('duplicate column name: notification_settings')) {
+                logger.error('Error adding "notification_settings" column to "users" table (SQLite):', err);
+            } else {
+                logger.info('"notification_settings" column already exists in "users" table (SQLite), skipping.');
             }
         });
 
@@ -245,7 +264,7 @@ async function initPostgreSQL() {
     // Given the schema is already defined with `TEXT PRIMARY KEY`, for PostgreSQL we'd typically
     // use `UUID PRIMARY KEY DEFAULT gen_random_uuid()`.
     // This conversion is more complex than a simple string replace.
-    // For now, let's just ensure the settings column is added.
+    // For now, let's just ensure the settings, profile, notification_settings columns are added.
     const pgSchema = schema
       .replace(/TEXT PRIMARY KEY/g, 'TEXT PRIMARY KEY') // Keep as TEXT PRIMARY KEY for now, UUID handled by alter
       .replace(/DATETIME DEFAULT CURRENT_TIMESTAMP/g, 'TIMESTAMP DEFAULT NOW()')
@@ -257,15 +276,20 @@ async function initPostgreSQL() {
 
     await _dbInstance.exec(pgSchema); // Use _dbInstance to create tables
 
-    // IMPORTANT: Add 'settings' column if it doesn't exist for PostgreSQL
+    // IMPORTANT: Add 'settings', 'profile', 'notification_settings' columns if they don't exist for PostgreSQL
     // PostgreSQL supports `ADD COLUMN IF NOT EXISTS`
-    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS settings TEXT;`)
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS settings TEXT DEFAULT '{}';`)
         .then(() => logger.info('Ensured "settings" column exists in "users" table (PostgreSQL).'))
-        .catch(err => {
-            // PostgreSQL will typically not error if IF NOT EXISTS is used and column exists.
-            // But if it does, log it.
-            logger.error('Error adding "settings" column to "users" table (PostgreSQL):', err);
-        });
+        .catch(err => { logger.error('Error adding "settings" column to "users" table (PostgreSQL):', err); });
+
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS profile TEXT DEFAULT '{}';`)
+        .then(() => logger.info('Ensured "profile" column exists in "users" table (PostgreSQL).'))
+        .catch(err => { logger.error('Error adding "profile" column to "users" table (PostgreSQL):', err); });
+
+    await _dbInstance.exec(`ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_settings TEXT DEFAULT '{}';`)
+        .then(() => logger.info('Ensured "notification_settings" column exists in "users" table (PostgreSQL).'))
+        .catch(err => { logger.error('Error adding "notification_settings" column to "users" table (PostgreSQL):', err); });
+
 
     logger.info(`✅ PostgreSQL database initialized: ${config.postgres.host}:${config.postgres.port}/${config.postgres.database}`);
     return _dbInstance;

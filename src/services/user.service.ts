@@ -82,7 +82,7 @@ export class UserService {
       // Return default settings or throw, depending on desired behavior
       return {
         notifications: { email: true, push: true, workflow: true, errors: true },
-        ai: { provider: 'ollama', model: 'llama3', temperature: 0.7, maxTokens: 2048 },
+        ai: { provider: 'ollama', model: 'llama3', temperature: 0.7, maxTokens: 768 },
         database: { type: 'sqlite', host: 'localhost', port: 5432, name: 'excelflow' },
         performance: { maxConcurrentTasks: 5, timeout: 300, retryAttempts: 3 }
       };

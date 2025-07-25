@@ -4,12 +4,11 @@ import { v4 as uuidv4 } from 'uuid';
 import { getDb } from '../database/init.js';
 import { authenticateToken } from '../middleware/auth.js';
 import { logger } from '../utils/logger.js';
-import { generateBusinessInsights } from '../agents/insightGeneratorAgent.js';
-import { adviseOnDecisions } from '../agents/decisionAdvisorAgent.js';
-// Import the new data aggregator
-import { getAggregatedBusinessData } from '../utils/dataAggregator.js';
-// Import the new LLM Client
-import { callLLM } from '../lib/llmClient.js'; // NEW IMPORT
+
+import { generateBusinessInsights } from '../agents/insightGeneratorAgent.js'; // <--- Ensure this is correct
+import { adviseOnDecisions } from '../agents/decisionAdvisorAgent.js';        // <--- Ensure this is correct
+import { callLLM } from '../lib/llmClient.js';  
+import { getAggregatedBusinessData } from '../utils/dataAggregator.js';  
 const router = express.Router();
 
 // --- Helper Functions (ALL YOUR ORIGINAL HELPER FUNCTIONS ARE RESTORED HERE) ---
@@ -45,6 +44,68 @@ const calculateStandardDeviation = (numbers) => {
     const mean = calculateMean(numbers);
     const variance = numbers.reduce((sum, num) => sum + Math.pow(num - mean, 2), 0) / (numbers.length - 1);
     return Math.sqrt(variance);
+};
+
+const processWorkflowResultsForInsights = (workflowResults) => {
+    let totalCompletedTasks = 0;
+    let totalRecordsProcessed = 0;
+    let totalErrorsFound = 0;
+    const errorTypeCounts = {};
+    const weeklySales = {}; // period -> total_sales
+    const productSales = {}; // productName -> { totalRevenue, totalUnitsSold }
+    const regionSales = {}; // regionName -> { totalRevenue, totalUnitsSold, prevPeriodRevenue }
+
+    workflowResults.forEach(result => {
+        if (result.status === 'completed') {
+            totalCompletedTasks++;
+        }
+
+        try {
+            if (result.metrics) {
+                const metrics = typeof result.metrics === 'string' ? JSON.parse(result.metrics) : result.metrics;
+                if (metrics.recordsProcessed) {
+                    totalRecordsProcessed += metrics.recordsProcessed;
+                }
+                if (metrics.errorsFound && Array.isArray(metrics.errorsFound)) {
+                    totalErrorsFound += metrics.errorsFound.length;
+                    metrics.errorsFound.forEach(error => {
+                        const category = error.type || 'Unknown';
+                        errorTypeCounts[category] = (errorTypeCounts[category] || 0) + 1;
+                    });
+                }
+            }
+
+            // This block is now mostly redundant as dataAggregator.js will handle output parsing
+            // However, if there are specific outputs needed *before* full aggregation for some reason, keep parts.
+            // For now, this is being simplified as dataAggregator.js is the source for LLM input.
+            if (result.output) {
+                const output = typeof result.output === 'string' ? JSON.parse(result.output) : result.output;
+                // Example of how one *might* process specific outputs if dataAggregator wasn't doing it generically
+                // This logic will be removed/refactored as dataAggregator.js now gives raw output to LLM
+            }
+
+        } catch (e) {
+            logger.warn('Failed to parse workflow_results output/metrics for insight generation:', e);
+        }
+    });
+
+    const errorDistribution = Object.entries(errorTypeCounts).map(([label, count]) => ({
+        name: label,
+        value: totalErrorsFound > 0 ? (count / totalErrorsFound) * 100 : 0
+    }));
+
+    // This return structure is what we used to send to LLM.
+    // Now getAggregatedBusinessData will provide the structure.
+    return {
+        totalCompletedTasks,
+        totalRecordsProcessed,
+        totalErrorsFound,
+        errorDistribution,
+        // The following are now derived or passed differently from dataAggregator
+        // productSales: Object.values(productSales),
+        // regionSales: Object.values(regionSales),
+        // weeklySalesTrends: Object.values(weeklySales)
+    };
 };
 
 const excelDateToJSDate = (excelDate) => {
@@ -1166,397 +1227,158 @@ router.post('/:workflowId/tasks/:taskId/execute', authenticateToken, async (req,
   }
 });
 
+// Helper to get week number (needed for analytics route)
+function getWeekNumber(d) {
+    // Copy date so don't modify original
+    d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+    // Set to nearest Thursday: current date + 4 - current day number
+    // Make Sunday's day number 7
+    d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+    // Get first day of year
+    var yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    // Calculate full weeks to nearest Thursday
+    var weekNo = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+    return weekNo;
+}
+
+router.get('/users/ai-settings', authenticateToken, async (req, res) => {
+    try {
+        const db = getDb();
+        const userId = req.user.id; // Assuming userId is available from authenticateToken middleware
+
+        // Fetch user's settings from the database
+        const userSettingsRow = await db.get('SELECT settings FROM users WHERE id = ?', [userId]);
+
+        let aiSettings = {
+            provider: process.env.DEFAULT_LLM_PROVIDER || 'ollama',
+            model: process.env.DEFAULT_LLM_MODEL || 'llama3',
+            temperature: parseFloat(process.env.DEFAULT_LLM_TEMPERATURE || '0.7'),
+            maxTokens: parseInt(process.env.DEFAULT_LLM_MAX_TOKENS || '2048'),
+        };
+
+        if (userSettingsRow && userSettingsRow.settings) {
+            try {
+                const parsedUserSettings = JSON.parse(userSettingsRow.settings);
+                // Merge default/env settings with user-specific AI settings from DB
+                if (parsedUserSettings.ai) {
+                    aiSettings = { ...aiSettings, ...parsedUserSettings.ai };
+                }
+            } catch (parseError) {
+                logger.warn('Failed to parse user settings from DB, using defaults and environment variables:', parseError);
+            }
+        }
+
+        // Do not send the API key to the frontend for security reasons
+        // It's handled internally by llmClient.js using process.env
+        delete aiSettings.aiProviderApiKey;
+
+        logger.info(`[Backend] Fetched AI settings for user ${userId} for frontend:`, aiSettings);
+        res.status(200).json(aiSettings);
+    } catch (error) {
+        logger.error(`[Backend] Error fetching AI settings for user ${userId}:`, error);
+        res.status(500).json({ message: 'Failed to fetch AI settings', error: error.message });
+    }
+});
+
+// --- API endpoint to save user-specific settings ---
+router.put('/users/settings', authenticateToken, async (req, res) => {
+    try {
+        const db = getDb();
+        const userId = req.user.id;
+        const newSettings = req.body; // This should be the entire settings object
+
+        // Fetch existing settings to merge or create new
+        const existingUser = await db.get('SELECT settings FROM users WHERE id = ?', [userId]);
+        let currentSettings = {};
+        if (existingUser && existingUser.settings) {
+            try {
+                currentSettings = JSON.parse(existingUser.settings);
+            } catch (parseError) {
+                logger.warn('Failed to parse existing user settings from DB, starting fresh for update:', parseError);
+            }
+        }
+
+        // Deep merge new settings with existing ones
+        const updatedSettings = { ...currentSettings, ...newSettings };
+
+        // Save the updated settings back to the database
+        await db.run('UPDATE users SET settings = ? WHERE id = ?', [JSON.stringify(updatedSettings), userId]);
+
+        logger.info(`[Backend] Saved settings for user ${userId}:`, updatedSettings);
+        res.status(200).json({ message: 'Settings saved successfully', settings: updatedSettings });
+    } catch (error) {
+        logger.error(`[Backend] Error saving settings for user ${userId}:`, error);
+        res.status(500).json({ message: 'Failed to save settings', error: error.message });
+    }
+});
+
+
 // --- NEW ANALYTICS ENDPOINTS FOR WORKFLOW DATA ---
 
 // Get processing trends (e.g., workflows completed/failed over time)
-router.get('/analytics/processing-trends', authenticateToken, async (req, res) => {
-  try {
-    const db = getDb();
-    const userId = req.user.userId;
-    const { period = '7days' } = req.query; // '7days', '30days', '6months', '12months'
-
-    let groupBy = 'strftime(\'%Y-%m-%d\', created_at)';
-    let dateFilter = 'datetime(\'now\', \'-7 days\')';
-
-    if (period === '30days') {
-      dateFilter = 'datetime(\'now\', \'-30 days\')';
-    } else if (period === '6months') {
-      groupBy = 'strftime(\'%Y-%m\', created_at)';
-      dateFilter = 'datetime(\'now\', \'-6 months\')';
-    } else if (period === '12months') {
-      groupBy = 'strftime(\'%Y-%m\', created_at)';
-      dateFilter = 'datetime(\'now\', \'-12 months\')';
-    }
-
-    const trends = await db.all(`
-      SELECT
-        ${groupBy} as period,
-        COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
-        COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
-      FROM workflows
-      WHERE user_id = ? AND created_at >= ${dateFilter}
-      GROUP BY period
-      ORDER BY period ASC
-    `, [userId]);
-
-    // Fill in missing periods with zero counts for a continuous chart
-    const processedTrends = [];
-    const now = new Date();
-    const numPeriods = period === '7days' || period === '30days' ? parseInt(period.replace('days', '')) : (period === '6months' ? 6 : 12);
-
-    for (let i = numPeriods - 1; i >= 0; i--) {
-        let date = new Date(now);
-        let periodLabel;
-
-        if (period.includes('days')) {
-            date.setDate(now.getDate() - i);
-            periodLabel = date.toISOString().split('T')[0]; // YYYY-MM-DD
-        } else { // months
-            date.setMonth(now.getMonth() - i);
-            periodLabel = date.toISOString().substring(0, 7); // YYYY-MM
-        }
-
-        const existing = trends.find(t => t.period === periodLabel);
-        processedTrends.push({
-            period: periodLabel,
-            completed: existing ? existing.completed : 0,
-            failed: existing ? existing.failed : 0
-        });
-    }
-
-    res.json(processedTrends);
-
-  } catch (error) {
-    logger.error('[Backend] Error fetching processing trends:', error);
-    res.status(500).json({ message: 'Failed to fetch processing trends', error: error.message });
-  }
-});
-
-// Get data quality distribution (e.g., breakdown of errors by type or task)
-router.get('/analytics/quality-distribution', authenticateToken, async (req, res) => {
-  try {
-    const db = getDb();
-    const userId = req.user.userId;
-    const { period = '30days' } = req.query; // Filter by recent results
-
-    let dateFunction; // Will hold the SQLite date function string
-    if (period === '7days') {
-      dateFunction = 'datetime(\'now\', \'-7 days\')';
-    } else if (period === '30days') {
-      dateFunction = 'datetime(\'now\', \'-30 days\')';
-    } else if (period === '6months') {
-      dateFunction = 'datetime(\'now\', \'-6 months\')';
-    } else if (period === '12months') {
-      dateFunction = 'datetime(\'now\', \'-12 months\')';
-    } else {
-      dateFunction = 'datetime(\'now\', \'-30 days\')'; // Default
-    }
-
-    // Fetch all relevant workflow results within the period
-    const results = await db.all(`
-      SELECT task_id, output, error, metrics, wr.status AS task_status
-      FROM workflow_results wr
-      JOIN workflows w ON wr.workflow_id = w.id
-      WHERE w.user_id = ? AND wr.completed_at >= ${dateFunction} -- CHANGED: Use dateFunction directly
-      AND wr.status = 'completed'
-    `, [userId]);
-
-    const errorTypeCounts = {};
-    const totalCompletedTasks = results.length;
-    let totalErrorsFound = 0;
-    let totalRecordsProcessed = 0;
-
-    results.forEach(result => {
-      try {
-        const metrics = JSON.parse(result.metrics || '{}');
-        const output = JSON.parse(result.output || '{}');
-
-        // Aggregate records processed
-        if (typeof metrics.recordsProcessed === 'number') {
-            totalRecordsProcessed += metrics.recordsProcessed;
-        } else if (output.metadata && typeof output.metadata.rowCount === 'number') {
-            totalRecordsProcessed += output.metadata.rowCount;
-        } else if (Array.isArray(output)) { // For analyze/clean outputs which are arrays of file data
-            totalRecordsProcessed += output.reduce((sum, item) => sum + (item.metadata?.rowCount || 0), 0);
-        }
-
-        // Aggregate error types if present in metrics.errorsFound (which is an array of strings)
-        if (Array.isArray(metrics.errorsFound) && metrics.errorsFound.length > 0) {
-            totalErrorsFound += metrics.errorsFound.length;
-            metrics.errorsFound.forEach(errorString => {
-                // Simple categorization based on common keywords
-                let errorCategory = 'Other';
-                const lowerError = errorString.toLowerCase();
-                if (lowerError.includes('missing') || lowerError.includes('empty') || lowerError.includes('null')) {
-                    errorCategory = 'Missing Data';
-                } else if (lowerError.includes('duplicate')) {
-                    errorCategory = 'Duplicates';
-                } else if (lowerError.includes('date') || lowerError.includes('format')) {
-                    errorCategory = 'Formatting Issues';
-                } else if (lowerError.includes('outlier') || lowerError.includes('range')) {
-                    errorCategory = 'Outliers/Range';
-                } else if (lowerError.includes('schema') || lowerError.includes('header') || lowerError.includes('inconsistent')) {
-                    errorCategory = 'Schema Inconsistency';
-                } else if (lowerError.includes('invalid') || lowerError.includes('violation')) {
-                    errorCategory = 'Validation Errors';
-                }
-                errorTypeCounts[errorCategory] = (errorTypeCounts[errorCategory] || 0) + 1;
-            });
-        }
-      } catch (parseError) {
-        logger.warn('Failed to parse workflow_results output/metrics for quality distribution:', parseError);
-      }
-    });
-
-    const totalErrorEntries = Object.values(errorTypeCounts).reduce((sum, count) => sum + count, 0);
-    const distributionData = Object.entries(errorTypeCounts).map(([label, count]) => ({
-      name: label,
-      value: totalErrorEntries > 0 ? (count / totalErrorEntries) * 100 : 0 // Percentage
-    }));
-
-    res.json({
-      totalCompletedTasks,
-      totalRecordsProcessed,
-      totalErrorsFound,
-      errorDistribution: distributionData,
-      rawErrorCounts: errorTypeCounts // For debugging/more detailed view
-    });
-
-  } catch (error) {
-    logger.error('[Backend] Error fetching quality distribution:', error);
-    res.status(500).json({ message: 'Failed to fetch data quality distribution', error: error.message });
-  }
-});
-
-// --- NEW AI INSIGHTS ENDPOINT ---
 router.get('/analytics/insights', authenticateToken, async (req, res) => {
+    const startTime = Date.now();
     try {
         const db = getDb();
         const userId = req.user.userId;
-        const { period = '30days' } = req.query; // Use period for insights too
 
-        // 1. Fetch user's AI settings
-        const userSettingsRow = await db.get(`SELECT settings FROM users WHERE id = ?`, [userId]);
-        let userAISettings = { provider: 'ollama', model: 'llama3', temperature: 0.7, maxTokens: 2048 };
+        const period = req.query.period || '30days';
+        let dateFilter = 'datetime(\'now\', \'-30 days\')';
+
+        if (period === '7days') {
+            dateFilter = 'datetime(\'now\', \'-7 days\');';
+        } else if (period === '6months') {
+            dateFilter = 'datetime(\'now\', \'-6 months\');';
+        } else if (period === '12months') {
+            dateFilter = 'datetime(\'now\', \'-12 months\');';
+        }
+
+        // Fetch user's AI settings from the database or use system defaults
+        const userSettingsRow = await db.get('SELECT settings FROM users WHERE id = ?', [userId]);
+        let userAISettings = {
+            provider: process.env.DEFAULT_LLM_PROVIDER || 'ollama',
+            model: process.env.DEFAULT_LLM_MODEL || 'llama3',
+            temperature: parseFloat(process.env.DEFAULT_LLM_TEMPERATURE || '0.7'),
+            maxTokens: parseInt(process.env.DEFAULT_LLM_MAX_TOKENS || '2048'),
+            // API key is sourced from environment variables for backend use, not from DB for security
+            aiProviderApiKey: process.env.GEMINI_API_KEY || process.env.OLLAMA_API_KEY || ''
+        };
+
         if (userSettingsRow && userSettingsRow.settings) {
             try {
-                const parsedSettings = JSON.parse(userSettingsRow.settings);
-                if (parsedSettings.ai) {
-                    userAISettings = { ...userAISettings, ...parsedSettings.ai };
+                const parsedUserSettings = JSON.parse(userSettingsRow.settings);
+                if (parsedUserSettings.ai) {
+                    userAISettings = { ...userAISettings, ...parsedUserSettings.ai };
                 }
             } catch (parseError) {
-                logger.warn(`[Backend] Failed to parse user settings for ${userId}:`, parseError);
+                logger.warn('Failed to parse user settings from DB in analytics endpoint, using defaults:', parseError);
             }
         }
-        logger.info(`[Backend] User AI Settings for insights:`, userAISettings);
 
-        // 2. Define a generic LLM client function to pass to agents
-        const llmClient = async (promptToCall, config) => {
-            const { provider, model, temperature, maxTokens } = config; // Use config passed to llmClient
+        logger.info(`[Backend] Fetching AI insights and decisions for user ${userId}, period ${period} with settings:`, userAISettings);
 
-            if (provider === 'ollama') {
-                const ollamaUrl = process.env.OLLAMA_API_URL || 'http://localhost:11434/api/generate';
-                const ollamaPayload = {
-                    model: model,
-                    prompt: promptToCall,
-                    stream: false,
-                    options: {
-                        temperature: temperature,
-                        num_predict: maxTokens
-                    }
-                };
-                const ollamaFetchResponse = await fetch(ollamaUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(ollamaPayload)
-                });
-                if (!ollamaFetchResponse.ok) {
-                    const errorText = await ollamaFetchResponse.text();
-                    throw new Error(`Ollama API error: ${ollamaFetchResponse.statusText}. Response: ${errorText}`);
-                }
-                const llmResponse = await ollamaFetchResponse.json();
-                const rawText = typeof llmResponse?.response === 'string' ? llmResponse.response.trim() : '';
-                if (!rawText) {
-                    throw new Error('Ollama returned empty response.');
-                }
-                return cleanAndParseJson(rawText); // Use your existing JSON cleaner
-            } else if (provider === 'gemini') {
-                const geminiModel = model || 'gemini-2.0-flash';
-                const chatHistory = [];
-                chatHistory.push({ role: "user", parts: [{ text: promptToCall }] });
-                const payload = {
-                    contents: chatHistory,
-                    generationConfig: {
-                        responseMimeType: "application/json", // Request JSON directly
-                        responseSchema: { // Provide a generic schema for array of objects
-                            type: "ARRAY",
-                            items: {
-                                type: "OBJECT",
-                                properties: {
-                                    // These properties will be filled by the LLM based on prompt
-                                    "type": { "type": "STRING" },
-                                    "title": { "type": "STRING" },
-                                    "description": { "type": "STRING" },
-                                    "recommendation": { "type": "STRING" },
-                                    "rationale": { "type": "STRING" },
-                                    "urgency": { "type": "STRING" },
-                                    "category": { "type": "STRING" }
-                                }
-                            }
-                        },
-                        temperature: temperature || 0.7,
-                        maxOutputTokens: maxTokens || 1024
-                    }
-                };
-                const apiKey = ""; // Canvas will provide this at runtime
-                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${apiKey}`;
-                const geminiFetchResponse = await fetch(apiUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-                if (!geminiFetchResponse.ok) {
-                    const errorText = await geminiFetchResponse.text();
-                    throw new Error(`Gemini API error: ${geminiFetchResponse.statusText}. Response: ${errorText}`);
-                }
-                const llmResponse = await geminiFetchResponse.json();
-                if (llmResponse.candidates && llmResponse.candidates.length > 0 &&
-                    llmResponse.candidates[0].content && llmResponse.candidates[0].content.parts &&
-                    llmResponse.candidates[0].content.parts.length > 0) {
-                    const jsonString = llmResponse.candidates[0].content.parts[0].text;
-                    return JSON.parse(jsonString);
-                } else {
-                    throw new Error('Gemini response had no candidates or content.');
-                }
-            } else {
-                throw new Error(`Unsupported AI provider: ${provider}.`);
-            }
-        };
+        // 1. Aggregate business data and operational metrics using the new generic aggregator
+        // Note: The `getAggregatedBusinessData` function should not depend on `req.query` for AI settings,
+        // it only needs userId and period. The AI settings are for the LLM call itself.
+        const analyticsDataForLLM = await getAggregatedBusinessData(userId, period);
 
-        // 3. Fetch aggregated business data for the Insight Generator
-        const businessData = await getAggregatedBusinessData(userId, period);
+        // 2. Generate insights and decisions using the LLM
+        // Pass userAISettings (which now correctly includes provider, model, etc., from DB/env) to both agents
+        const insights = await generateBusinessInsights(callLLM, analyticsDataForLLM, userAISettings);
+        const decisions = await adviseOnDecisions(callLLM, insights, userAISettings);
 
-        // 4. Fetch operational analytics data (reusing existing logic)
-        // Processing Trends
-        let groupBy = 'strftime(\'%Y-%m-%d\', created_at)';
-        let dateFilterTrends = 'datetime(\'now\', \'-7 days\')';
-        if (period === '30days') {
-          dateFilterTrends = 'datetime(\'now\', \'-30 days\')';
-        } else if (period === '6months') {
-          groupBy = 'strftime(\'%Y-%m\', created_at)';
-          dateFilterTrends = 'datetime(\'now\', \'-6 months\')';
-        } else if (period === '12months') {
-          groupBy = 'strftime(\'%Y-%m\', created_at)';
-          dateFilterTrends = 'datetime(\'now\', \'-12 months\')';
-        }
-
-        const trends = await db.all(`
-          SELECT
-            ${groupBy} as period,
-            COUNT(CASE WHEN status = 'completed' THEN 1 END) as completed,
-            COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed
-          FROM workflows
-          WHERE user_id = ? AND created_at >= ${dateFilterTrends}
-          GROUP BY period
-          ORDER BY period ASC
-        `, [userId]);
-
-        // Data Quality Distribution (and totals)
-        let dateFilterQuality = 'datetime(\'now\', \'-30 days\')';
-        if (period === '7days') {
-          dateFilterQuality = 'datetime(\'now\', \'-7 days\')';
-        } else if (period === '6months') {
-          dateFilterQuality = 'datetime(\'now\', \'-6 months\')';
-        } else if (period === '12months') {
-          dateFilterQuality = 'datetime(\'now\', \'-12 months\')';
-        }
-
-        const qualityResults = await db.all(`
-          SELECT task_id, output, error, metrics, wr.status AS task_status
-          FROM workflow_results wr
-          JOIN workflows w ON wr.workflow_id = w.id
-          WHERE w.user_id = ? AND wr.completed_at >= ${dateFilterQuality}
-          AND wr.status = 'completed'
-        `, [userId]);
-
-        const errorTypeCounts = {};
-        const totalCompletedTasks = qualityResults.length;
-        let totalErrorsFound = 0;
-        let totalRecordsProcessed = 0;
-
-        qualityResults.forEach(result => {
-          try {
-            const metrics = JSON.parse(result.metrics || '{}');
-            const output = JSON.parse(result.output || '{}');
-
-            if (typeof metrics.recordsProcessed === 'number') {
-                totalRecordsProcessed += metrics.recordsProcessed;
-            } else if (output.metadata && typeof output.metadata.rowCount === 'number') {
-                totalRecordsProcessed += output.metadata.rowCount;
-            } else if (Array.isArray(output)) {
-                totalRecordsProcessed += output.reduce((sum, item) => sum + (item.metadata?.rowCount || 0), 0);
-            }
-
-            if (Array.isArray(metrics.errorsFound) && metrics.errorsFound.length > 0) {
-                totalErrorsFound += metrics.errorsFound.length;
-                metrics.errorsFound.forEach(errorString => {
-                    let errorCategory = 'Other';
-                    const lowerError = errorString.toLowerCase();
-                    if (lowerError.includes('missing') || lowerError.includes('empty') || lowerError.includes('null')) {
-                        errorCategory = 'Missing Data';
-                    } else if (lowerError.includes('duplicate')) {
-                        errorCategory = 'Duplicates';
-                    } else if (lowerError.includes('date') || lowerError.includes('format')) {
-                        errorCategory = 'Formatting Issues';
-                    } else if (lowerError.includes('outlier') || lowerError.includes('range')) {
-                        errorCategory = 'Outliers/Range';
-                    } else if (lowerError.includes('schema') || lowerError.includes('header') || lowerError.includes('inconsistent')) {
-                        errorCategory = 'Schema Inconsistency';
-                    } else if (lowerError.includes('invalid') || lowerError.includes('violation')) {
-                        errorCategory = 'Validation Errors';
-                    }
-                    errorTypeCounts[errorCategory] = (errorTypeCounts[errorCategory] || 0) + 1;
-                });
-            }
-          } catch (parseError) {
-            logger.warn('Failed to parse workflow_results output/metrics for insight generation:', parseError);
-          }
-        });
-
-        const errorDistribution = Object.entries(errorTypeCounts).map(([label, count]) => ({
-            name: label,
-            value: totalErrorsFound > 0 ? (count / totalErrorsFound) * 100 : 0
-        }));
-
-        const operationalAnalyticsDataForLLM = {
-            totalCompletedTasks,
-            totalRecordsProcessed,
-            totalErrorsFound,
-            errorDistribution,
-            processingTrends: trends
-        };
-
-
-        // 5. Call the Insight Generator Agent with both business and operational data
-        const combinedDataForInsightAgent = {
-            ...businessData, // Product, Region, Sales Trends
-            errorDistribution: operationalAnalyticsDataForLLM.errorDistribution // Error anomalies
-        };
-        const generatedInsights = await generateBusinessInsights(callLLM, combinedDataForInsightAgent, userAISettings);
-
-        // 6. Call the Decision Advisor Agent with the generated insights
-        const generatedDecisions = await adviseOnDecisions(callLLM, generatedInsights, userAISettings);
-
-        // 7. Return both insights and decisions to the frontend
-        res.json({
-            insights: generatedInsights,
-            decisions: generatedDecisions
-        });
+        // 3. Send combined response
+        logger.info(`[Backend] Sending final AI insights and decisions to frontend:`, { insights, decisions });
+        res.json({ insights, decisions });
 
     } catch (error) {
         logger.error('[Backend] Error generating AI insights or decisions:', error);
-        res.status(500).json({ message: 'Failed to generate AI insights or decisions', error: error.message });
+        res.status(500).json({ message: 'Failed to generate AI insights and decisions', error: error.message });
+    } finally {
+        const duration = Date.now() - startTime;
+        logger.info(`[Timing] insights_endpoint_response_time: ${duration}ms`);
     }
 });
+
 
 export default router;
