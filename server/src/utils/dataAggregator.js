@@ -8,7 +8,8 @@ import { getDb } from '../database/init.js';
  *
  * @param {string} userId - The ID of the user.
  * @param {string} period - The time period (e.g., '7days', '30days', '6months', '12months').
- * @returns {Promise<object>} An object containing aggregated operational metrics and raw workflow outputs/metrics.
+ * @returns {Promise<object>} An object containing aggregated operational metrics and raw workflow outputs/metrics,
+ * plus structured data for analytics charts.
  */
 export async function getAggregatedBusinessData(userId, period) {
     const db = getDb();
@@ -29,6 +30,7 @@ export async function getAggregatedBusinessData(userId, period) {
             wr.output,
             wr.metrics,
             wr.task_id,      -- Select task_id to match with parsed tasks
+            wr.completed_at, -- Needed for processing trends
             w.name as workflowName,
             w.tasks as workflowTasks -- Select the tasks JSON string from workflows table
         FROM
@@ -47,6 +49,13 @@ export async function getAggregatedBusinessData(userId, period) {
     const allWorkflowOutputs = []; // To store all relevant outputs for LLM
     const allWorkflowMetrics = []; // To store all relevant metrics for LLM
 
+    // Data structures for charts
+    const processingTrendsMap = new Map(); // date -> { completed: N, failed: M }
+    const salesTrendsMap = new Map();       // date -> { revenue: N, units_sold: M }
+    const productPerformanceMap = new Map(); // productName -> { revenue: N, units_sold: M }
+    const regionPerformanceMap = new Map();  // regionName -> { revenue: N, units_sold: M }
+
+
     for (const row of results) {
         let taskType = 'unknown';
         // Extract taskType from workflowTasks JSON
@@ -60,10 +69,20 @@ export async function getAggregatedBusinessData(userId, period) {
             logger.warn(`[DataAggregator] Failed to parse workflowTasks for workflow ${row.workflowName}:`, e);
         }
 
-        // Count completed tasks and processed records
-        // Using the dynamically extracted taskType
+        // Aggregate operational metrics
         if (taskType === 'clean' || taskType === 'merge' || taskType === 'analyze' || taskType === 'report' || taskType === 'validate') {
-            totalCompletedTasks++;
+            totalCompletedTasks++; // Count any relevant task as "completed" for trends (can refine later)
+
+            // Processing Trends
+            const completionDate = row.completed_at ? new Date(row.completed_at).toISOString().split('T')[0] : 'Unknown Date';
+            const trendEntry = processingTrendsMap.get(completionDate) || { date: completionDate, completed: 0, failed: 0 };
+            if (row.status === 'completed') { // Assuming row.status is available from DB (it is in workflow_results)
+                trendEntry.completed++;
+            } else if (row.status === 'failed') {
+                trendEntry.failed++;
+            }
+            processingTrendsMap.set(completionDate, trendEntry);
+
             try {
                 const metrics = JSON.parse(row.metrics || '{}');
                 if (metrics.recordsProcessed) {
@@ -103,7 +122,6 @@ export async function getAggregatedBusinessData(userId, period) {
         if (row.output) {
             try {
                 const parsedOutput = JSON.parse(row.output);
-                // --- START OF NEW CHANGE ---
                 // If the output contains 'headers' and 'rows', pass them explicitly
                 if (parsedOutput.headers && Array.isArray(parsedOutput.headers) && parsedOutput.rows && Array.isArray(parsedOutput.rows)) {
                     allWorkflowOutputs.push({
@@ -114,6 +132,46 @@ export async function getAggregatedBusinessData(userId, period) {
                             rows: parsedOutput.rows
                         }
                     });
+
+                    // --- Extract data for Sales, Product, and Region Performance charts ---
+                    const revenueColIndex = parsedOutput.headers.indexOf('Revenue_Amount');
+                    const unitsSoldColIndex = parsedOutput.headers.indexOf('Units_Count');
+                    const productNameColIndex = parsedOutput.headers.indexOf('Product_Name');
+                    const regionColIndex = parsedOutput.headers.indexOf('Region');
+                    const transactionDateColIndex = parsedOutput.headers.indexOf('Transaction_Date');
+
+                    parsedOutput.rows.forEach(dataRow => {
+                        const revenue = revenueColIndex !== -1 ? parseFloat(dataRow[revenueColIndex]) : 0;
+                        const unitsSold = unitsSoldColIndex !== -1 ? parseFloat(dataRow[unitsSoldColIndex]) : 0;
+                        const productName = productNameColIndex !== -1 ? String(dataRow[productNameColIndex]) : 'Unknown Product';
+                        const region = regionColIndex !== -1 ? String(dataRow[regionColIndex]) : 'Unknown Region';
+                        const transactionDate = transactionDateColIndex !== -1 ? new Date(dataRow[transactionDateColIndex]).toISOString().split('T')[0] : completionDate; // Fallback to task completion date
+
+                        // Sales Trends
+                        if (!isNaN(revenue) && !isNaN(unitsSold)) {
+                            const trendEntry = salesTrendsMap.get(transactionDate) || { date: transactionDate, revenue: 0, units_sold: 0 };
+                            trendEntry.revenue += revenue;
+                            trendEntry.units_sold += unitsSold;
+                            salesTrendsMap.set(transactionDate, trendEntry);
+                        }
+
+                        // Product Performance
+                        if (!isNaN(revenue) && productName !== 'Unknown Product') {
+                            const productEntry = productPerformanceMap.get(productName) || { name: productName, revenue: 0, units_sold: 0 };
+                            productEntry.revenue += revenue;
+                            productEntry.units_sold += unitsSold;
+                            productPerformanceMap.set(productName, productEntry);
+                        }
+
+                        // Region Performance
+                        if (!isNaN(revenue) && region !== 'Unknown Region') {
+                            const regionEntry = regionPerformanceMap.get(region) || { region: region, revenue: 0, units_sold: 0 };
+                            regionEntry.revenue += revenue;
+                            regionEntry.units_sold += unitsSold;
+                            regionPerformanceMap.set(region, regionEntry);
+                        }
+                    });
+
                 } else {
                     // Otherwise, pass the full parsedOutput as is, allowing LLM to interpret
                     allWorkflowOutputs.push({
@@ -122,7 +180,6 @@ export async function getAggregatedBusinessData(userId, period) {
                         output: parsedOutput
                     });
                 }
-                // --- END OF NEW CHANGE ---
             } catch (e) {
                 logger.warn('[DataAggregator] Failed to parse workflow result output:', e);
             }
@@ -147,16 +204,31 @@ export async function getAggregatedBusinessData(userId, period) {
         value: totalErrorsFound > 0 ? (count / totalErrorsFound) * 100 : 0
     }));
 
+    // Convert Maps to arrays and sort them for consistent chart display
+    const processingTrendsData = Array.from(processingTrendsMap.values()).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    const salesTrendsData = Array.from(salesTrendsMap.values()).sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+    const productPerformanceData = Array.from(productPerformanceMap.values()).sort((a, b) => b.revenue - a.revenue); // Sort by revenue descending
+    const regionPerformanceData = Array.from(regionPerformanceMap.values()).sort((a, b) => b.revenue - a.revenue); // Sort by revenue descending
+
+
     const aggregatedData = {
         totalCompletedTasks,
         totalRecordsProcessed,
         totalErrorsFound,
         errorDistribution,
         allWorkflowOutputs,
-        allWorkflowMetrics
+        allWorkflowMetrics,
+        // Structured data specifically for frontend charts
+        analyticsChartsData: {
+            processingTrends: processingTrendsData,
+            dataQualityDistribution: errorDistribution, // Re-use already calculated errorDistribution
+            salesTrends: salesTrendsData,
+            productPerformance: productPerformanceData,
+            regionPerformance: regionPerformanceData,
+        }
     };
 
-    logger.info(`[DataAggregator] Aggregated Data for LLM:`, aggregatedData);
+    logger.info(`[DataAggregator] Aggregated Data for LLM and Charts:`, aggregatedData);
 
     return aggregatedData;
 }

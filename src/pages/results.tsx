@@ -1,9 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label'; // ADDED: Import Label
+import { Label } from '@/components/ui/label';
 import axios from 'axios';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -19,26 +19,46 @@ import {
   CheckCircle,
   AlertCircle,
   Clock,
-  X, // For close button in modals
-  Bug, // New icon for errors
+  X,
+  Bug,
   Loader2,
   Bot,
-  Lightbulb, // For insights
-  Megaphone, // For decisions/recommendations
-  Globe, // Added for region_performance insight icon
-  ShoppingCart, // For product_performance insight icon
-  TrendingUp, // For sales_trend insight icon
-  Zap, // For anomaly_detection
-  Settings, // For operational_efficiency
-  DollarSign, // For financial_overview
-  Users, // For customer_relations
-  ShieldAlert // For risk_management
+  Lightbulb,
+  Megaphone,
+  Globe,
+  ShoppingCart,
+  TrendingUp,
+  Zap,
+  Settings,
+  DollarSign,
+  Users,
+  ShieldAlert,
+  MapPin
 } from 'lucide-react';
 import { useWorkflow } from '@/contexts/workflow-context';
-import { ResponsiveContainer, LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, BarChart, Bar, Legend } from 'recharts';
-import { WorkflowService, AiInsight, DecisionRecommendation, WorkflowResult, AiSettings } from '@/services/workflow.service';
-import { UserService, UserSettings } from '@/services/user.service'; // Import UserService and UserSettings
+import { ResponsiveContainer, LineChart, Line, CartesianGrid, XAxis, YAxis, Tooltip, PieChart, Pie, Cell, Legend, BarChart, Bar } from 'recharts';
 import { toast } from 'sonner';
+
+// --- IMPORT ACTUAL WorkflowService AND UserService ---
+// Importing all necessary interfaces and the WorkflowService from your service file
+import {
+  WorkflowResult,
+  AiInsight,
+  DecisionRecommendation,
+  ProcessingTrendData,
+  DataQualityDistributionData,
+  SalesTrendData,
+  ProductPerformanceData,
+  RegionPerformanceData,
+  AiInsightsAndDecisionsResponse,
+  AiSettings,
+  WorkflowService // Import the WorkflowService itself
+} from '@/services/workflow.service';
+
+// Importing the actual UserService. Ensure this file exists at '@/services/user.service'.
+// If it does not exist, you will need to create it with a proper implementation.
+import { UserService } from '@/services/user.service';
+
 
 // Define the type for the processed workflow results to be displayed in the main list
 interface WorkflowResultDisplay {
@@ -401,7 +421,16 @@ export default function Results() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  
+  // --- NEW STATE FOR ANALYTICS DATA --
+  const [processingTrendsData, setProcessingTrendsData] = useState<ProcessingTrendData[]>([]);
+  const [dataQualityDistributionData, setDataQualityDistributionData] = useState<DataQualityDistributionData[]>([]);
+  const [salesTrendsData, setSalesTrendsData] = useState<SalesTrendData[]>([]);
+  const [productPerformanceData, setProductPerformanceData] = useState<ProductPerformanceData[]>([]);
+  const [regionPerformanceData, setRegionPerformanceData] = useState<RegionPerformanceData[]>([]);
+
+  // --- State for active tab ---
+  const [activeTab, setActiveTab] = useState('results');
+
   // --- UPDATED STATE FOR ANALYTICS AND INSIGHTS DATA ---
   const [aiInsights, setAiInsights] = useState<AiInsight[]>([]);
   const [decisionRecommendations, setDecisionRecommendations] = useState<DecisionRecommendation[]>([]);
@@ -415,12 +444,17 @@ export default function Results() {
   const [aiTemperature, setAiTemperature] = useState<number>(0.7); // Default
   const [aiMaxTokens, setAiMaxTokens] = useState<number>(768); // Default
 
+  // --- CACHE FOR ANALYTICS AND INSIGHTS (Client-side cache) ---
+  const analyticsCache = useRef<{
+    [key: string]: AiInsightsAndDecisionsResponse; // Cache stores the full API response
+  }>({});
 
   // Effect to fetch user AI settings on component mount
   useEffect(() => {
     const fetchUserAiSettings = async () => {
       try {
-        const fetchedSettings: UserSettings = await UserService.getUserSettings();
+        // Assuming UserService is correctly implemented and returns an object with an 'ai' property
+        const fetchedSettings: { ai?: AiSettings } = await UserService.getUserSettings();
         if (fetchedSettings && fetchedSettings.ai) {
           setAiProvider(fetchedSettings.ai.provider || 'ollama');
           setAiModel(fetchedSettings.ai.model || 'llama3');
@@ -460,7 +494,7 @@ export default function Results() {
             console.log(`Frontend Debug: Latest completed result for workflow ${workflow.id}:`, latestResult);
 
             if (latestResult && latestResult.output) {
-                let parsedOutput: any = latestResult.output;
+                let parsedOutput: any = latestResult.output; // Corrected: Use latestResult.output
 
                 console.log(`Frontend Debug: Parsed output for workflow ${workflow.id}:`, parsedOutput);
 
@@ -580,82 +614,132 @@ export default function Results() {
     }
   }, [workflows, getWorkflowResults]);
 
-  useEffect(() => {
-    const fetchAllAnalyticsData = async () => {
-      // Use the states that were initialized from user settings
-      console.log(`Frontend Debug: fetchAllAnalyticsData started for period: ${analyticsPeriod}, provider: ${aiProvider}, model: ${aiModel}, temp: ${aiTemperature}, tokens: ${aiMaxTokens}`);
-      setIsLoadingAnalytics(true);
+  // Function to fetch analytics, insights, and decisions (with caching)
+  const fetchAnalyticsAndInsights = useCallback(async (period: string) => {
+    // Use the states that were initialized from user settings
+    console.log(`Frontend Debug: fetchAnalyticsAndInsights started for period: ${period}, provider: ${aiProvider}, model: ${aiModel}, temp: ${aiTemperature}, tokens: ${aiMaxTokens}`);
+    setIsLoadingAnalytics(true);
 
-      const currentAiSettings: AiSettings = {
-        provider: aiProvider,
-        model: aiModel,
-        temperature: aiTemperature,
-        maxTokens: aiMaxTokens,
-      };
-
-      try {
-        const data = await WorkflowService.getAiInsightsAndDecisions(analyticsPeriod, currentAiSettings);
-        console.log('Frontend Debug: getAiInsightsAndDecisions completed.');
-        console.log('Frontend Debug: Raw response from getAiInsightsAndDecisions:', data);
-
-        const {
-          insights,
-          decisions,
-        } = data || {};
-
-        const isValidInsight = (item: any): item is AiInsight =>
-          item && typeof item.title === 'string' && typeof item.description === 'string' && typeof item.type === 'string';
-
-        const isValidDecision = (item: any): item is DecisionRecommendation =>
-          item && typeof item.recommendation === 'string' &&
-          typeof item.rationale === 'string' &&
-          typeof item.urgency === 'string' &&
-          typeof item.category === 'string';
-
-        const validInsights = Array.isArray(insights) ? insights.filter(isValidInsight) : [];
-        const validDecisions = Array.isArray(decisions) ? decisions.filter(isValidDecision) : [];
-
-        setAiInsights(validInsights);
-        setDecisionRecommendations(validDecisions);
-
-        if (!validInsights.length && !validDecisions.length) {
-          toast.error('AI did not return valid insights or decisions for this period.');
-          console.warn('Frontend Debug: AI did not return valid insights or decisions.');
-        } else {
-          toast.success('Analytics data, insights, and decisions refreshed!');
-          console.log('Frontend Debug: Analytics data, insights, and decisions successfully refreshed.');
-        }
-
-      } catch (error: unknown) {
-        console.error('Frontend Debug: Error fetching analytics data, insights, or decisions:', error);
-
-        if (axios.isAxiosError(error)) {
-          const message = error.response?.data?.message || error.message || 'Unknown Axios error';
-          console.error('Frontend Debug: AxiosError details:', {
-            message,
-            code: error.code,
-            status: error.response?.status,
-            data: error.response?.data,
-            headers: error.response?.headers,
-          });
-          toast.error(`Error fetching analytics data: ${message}`);
-        } else {
-          const fallbackMessage = error instanceof Error ? error.message : 'Unknown error occurred.';
-          toast.error(`Error fetching analytics data: ${fallbackMessage}`);
-        }
-
-        setAiInsights([]);
-        setDecisionRecommendations([]);
-      } finally {
-        setIsLoadingAnalytics(false);
-        console.log(`Frontend Debug: fetchAllAnalyticsData finished for period: ${analyticsPeriod}`);
-      }
+    const currentAiSettings: AiSettings = {
+      provider: aiProvider,
+      model: aiModel,
+      temperature: aiTemperature,
+      maxTokens: aiMaxTokens,
     };
 
-    // Trigger fetch when period or AI settings change
-    // These states are now controlled by UserService.getUserSettings()
-    fetchAllAnalyticsData();
-  }, [analyticsPeriod, aiProvider, aiModel, aiTemperature, aiMaxTokens]);
+    const cacheKey = `${period}-${aiProvider}-${aiModel}-${aiTemperature}-${aiMaxTokens}`;
+    if (analyticsCache.current[cacheKey]) {
+      const cachedData = analyticsCache.current[cacheKey];
+      // Defensive checks for cached data properties
+      setAiInsights(cachedData.insights || []);
+      setDecisionRecommendations(cachedData.decisions || []);
+      // Ensure analyticsData is an object before accessing its properties
+      const safeCachedAnalyticsData = cachedData.analyticsData || {};
+      setProcessingTrendsData(safeCachedAnalyticsData.processingTrends || []);
+      setDataQualityDistributionData(safeCachedAnalyticsData.dataQualityDistribution || []);
+      setSalesTrendsData(safeCachedAnalyticsData.salesTrends || []);
+      setProductPerformanceData(safeCachedAnalyticsData.productPerformance || []);
+      setRegionPerformanceData(safeCachedAnalyticsData.regionPerformance || []);
+      setIsLoadingAnalytics(false);
+      console.log(`Analytics data for ${period} loaded from client-side cache.`);
+      return;
+    }
+
+    // Clear previous data before new fetch
+    setAiInsights([]);
+    setDecisionRecommendations([]);
+    setProcessingTrendsData([]);
+    setDataQualityDistributionData([]);
+    setSalesTrendsData([]);
+    setProductPerformanceData([]);
+    setRegionPerformanceData([]);
+
+    try {
+      const apiResponse = await WorkflowService.getAiInsightsAndDecisions(period, currentAiSettings);
+      console.log('Frontend Debug: getAiInsightsAndDecisions completed.');
+      console.log('Frontend Debug: Raw response from getAiInsightsAndDecisions:', apiResponse);
+
+      // Ensure apiResponse and its analyticsData property are properly structured
+      const insights = Array.isArray(apiResponse?.insights) ? apiResponse.insights : [];
+      const decisions = Array.isArray(apiResponse?.decisions) ? apiResponse.decisions : [];
+
+      // Create a safely structured analyticsData object from the API response
+      const safeAnalyticsData = {
+        processingTrends: Array.isArray(apiResponse?.analyticsData?.processingTrends) ? apiResponse.analyticsData.processingTrends : [],
+        dataQualityDistribution: Array.isArray(apiResponse?.analyticsData?.dataQualityDistribution) ? apiResponse.analyticsData.dataQualityDistribution : [],
+        salesTrends: Array.isArray(apiResponse?.analyticsData?.salesTrends) ? apiResponse.analyticsData.salesTrends : [],
+        productPerformance: Array.isArray(apiResponse?.analyticsData?.productPerformance) ? apiResponse.analyticsData.productPerformance : [],
+        regionPerformance: Array.isArray(apiResponse?.analyticsData?.regionPerformance) ? apiResponse.analyticsData.regionPerformance : [],
+      };
+
+      setAiInsights(insights);
+      setDecisionRecommendations(decisions);
+      setProcessingTrendsData(safeAnalyticsData.processingTrends);
+      setDataQualityDistributionData(safeAnalyticsData.dataQualityDistribution);
+      setSalesTrendsData(safeAnalyticsData.salesTrends);
+      setProductPerformanceData(safeAnalyticsData.productPerformance);
+      setRegionPerformanceData(safeAnalyticsData.regionPerformance);
+
+      // Store a fully structured object in cache to ensure consistency
+      analyticsCache.current[cacheKey] = {
+        insights: insights,
+        decisions: decisions,
+        analyticsData: safeAnalyticsData,
+      };
+
+      if (!insights.length && !decisions.length && (
+          safeAnalyticsData.processingTrends.length === 0 &&
+          safeAnalyticsData.dataQualityDistribution.length === 0 &&
+          safeAnalyticsData.salesTrends.length === 0 &&
+          safeAnalyticsData.productPerformance.length === 0 &&
+          safeAnalyticsData.regionPerformance.length === 0
+      )) {
+        toast.error('AI did not return valid insights or decisions, and no analytics data was available for this period.');
+        console.warn('Frontend Debug: AI did not return valid insights or decisions, and no analytics data.');
+      } else {
+        toast.success('Analytics data, insights, and decisions refreshed!');
+        console.log('Frontend Debug: Analytics data, insights, and decisions successfully refreshed.');
+      }
+
+    } catch (error: unknown) {
+      console.error('Frontend Debug: Error fetching analytics data, insights, or decisions:', error);
+
+      if (axios.isAxiosError(error)) {
+        const message = error.response?.data?.message || error.message || 'Unknown Axios error';
+        console.error('Frontend Debug: AxiosError details:', {
+          message,
+          code: error.code,
+          status: error.response?.status,
+          data: error.response?.data,
+          headers: error.response?.headers,
+        });
+        toast.error(`Error fetching analytics data: ${message}`);
+      } else {
+        const fallbackMessage = error instanceof Error ? error.message : 'Unknown error occurred.';
+        toast.error(`Error fetching analytics data: ${fallbackMessage}`);
+      }
+
+      setAiInsights([]);
+      setDecisionRecommendations([]);
+      setProcessingTrendsData([]);
+      setDataQualityDistributionData([]);
+      setSalesTrendsData([]);
+      setProductPerformanceData([]);
+      setRegionPerformanceData([]);
+    } finally {
+      setIsLoadingAnalytics(false);
+      console.log(`Frontend Debug: fetchAnalyticsAndInsights finished for period: ${period}`);
+    }
+  }, [analyticsPeriod, aiProvider, aiModel, aiTemperature, aiMaxTokens]); // Dependencies for useCallback
+
+  // Effect to trigger data fetch when tab or period or AI settings change
+  useEffect(() => {
+    // Only fetch if on tabs that require analytics/insights/decisions data
+    if (activeTab === 'analytics' || activeTab === 'insights' || activeTab === 'decisions') {
+      fetchAnalyticsAndInsights(analyticsPeriod);
+    }
+  }, [activeTab, analyticsPeriod, aiProvider, aiModel, aiTemperature, aiMaxTokens, fetchAnalyticsAndInsights]);
+
 
   const filteredResults = actualResults.filter(result => {
     const matchesSearch = result.workflowName.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -666,6 +750,8 @@ export default function Results() {
 
     return matchesSearch && matchesType && matchesStatus;
   });
+
+  const COLORS = ['#0088FE', '#00C49F', '#FFBB28', '#FF8042', '#AF19FF', '#FF0057', '#808080', '#D3D3D3']; // Defined COLORS for charts
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -891,7 +977,7 @@ export default function Results() {
         </CardContent>
       </Card>
 
-      <Tabs defaultValue="results" className="space-y-4">
+      <Tabs defaultValue="results" className="space-y-4" onValueChange={setActiveTab}> {/* Add onValueChange to update activeTab state */}
         <TabsList>
           <TabsTrigger value="results">Results</TabsTrigger>
           <TabsTrigger value="analytics">Analytics</TabsTrigger>
@@ -1020,25 +1106,151 @@ export default function Results() {
               ) : (
                 <>
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-6">
+                    {/* Processing Trends */}
                     <Card>
                       <CardHeader>
-                        <CardTitle>Processing Trends</CardTitle>
+                        <CardTitle className="flex items-center"><TrendingUp className="h-4 w-4 mr-2" />Processing Trends</CardTitle>
                         <CardDescription>Workflow completion rates over time</CardDescription>
                       </CardHeader>
                       <CardContent className="min-h-[250px] flex items-center justify-center">
-                        <p className="text-center text-muted-foreground py-8">Processing trends data is currently not available via this API. Please check backend aggregation logic.</p>
+                        {processingTrendsData.length > 0 ? (
+                          <ResponsiveContainer width="100%" height={250}>
+                            <LineChart data={processingTrendsData}>
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis dataKey="date" />
+                              <YAxis />
+                              <Tooltip />
+                              <Legend />
+                              <Line type="monotone" dataKey="completed" stroke="#8884d8" name="Completed Workflows" />
+                              <Line type="monotone" dataKey="failed" stroke="#FF0057" name="Failed Workflows" />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <p className="text-center text-muted-foreground py-8">No processing trends data available for this period.</p>
+                        )}
                       </CardContent>
                     </Card>
 
+                    {/* Data Quality Distribution */}
                     <Card>
                       <CardHeader>
-                        <CardTitle>Data Quality Distribution</CardTitle>
+                        <CardTitle className="flex items-center"><ShieldAlert className="h-4 w-4 mr-2" />Data Quality Distribution</CardTitle>
                         <CardDescription>Breakdown of errors found in processed data</CardDescription>
                       </CardHeader>
                       <CardContent className="min-h-[250px] flex items-center justify-center">
-                        <p className="text-center text-muted-foreground py-8">Data quality distribution data is currently not available via this API. Please check backend aggregation logic.</p>
+                        {dataQualityDistributionData.length > 0 ? (
+                          <ResponsiveContainer width="100%" height={250}>
+                            <PieChart>
+                              <Pie
+                                data={dataQualityDistributionData}
+                                cx="50%"
+                                cy="50%"
+                                labelLine={false}
+                                outerRadius={80}
+                                fill="#8884d8"
+                                dataKey="value"
+                                nameKey="name"
+                                label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}
+                              >
+                                {dataQualityDistributionData.map((entry, index) => (
+                                  <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                                ))}
+                              </Pie>
+                              <Tooltip />
+                              <Legend />
+                            </PieChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <p className="text-center text-muted-foreground py-8">No data quality distribution data available for this period.</p>
+                        )}
                       </CardContent>
                     </Card>
+
+                    {/* Sales Trends */}
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="flex items-center"><DollarSign className="h-4 w-4 mr-2" />Sales Trends</CardTitle>
+                        <CardDescription>Revenue and units sold over time</CardDescription>
+                      </CardHeader>
+                      <CardContent className="min-h-[250px] flex items-center justify-center">
+                        {salesTrendsData.length > 0 ? (
+                          <ResponsiveContainer width="100%" height={250}>
+                            <LineChart data={salesTrendsData}>
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis dataKey="date" />
+                              <YAxis yAxisId="left" orientation="left" stroke="#8884d8" label={{ value: 'Revenue ($)', angle: -90, position: 'insideLeft' }} />
+                              <YAxis yAxisId="right" orientation="right" stroke="#82ca9d" label={{ value: 'Units Sold', angle: 90, position: 'insideRight' }} />
+                              <Tooltip formatter={(value: number, name: string) => [`${value.toLocaleString()}`, name]} />
+                              <Legend />
+                              <Line yAxisId="left" type="monotone" dataKey="revenue" stroke="#8884d8" name="Revenue" activeDot={{ r: 8 }} />
+                              <Line yAxisId="right" type="monotone" dataKey="units_sold" stroke="#82ca9d" name="Units Sold" activeDot={{ r: 8 }} />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <p className="text-center text-muted-foreground py-8">No sales trends data available for this period.</p>
+                        )}
+                      </CardContent>
+                    </Card>
+
+                    {/* Product Performance */}
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="flex items-center"><ShoppingCart className="h-4 w-4 mr-2" />Product Performance</CardTitle>
+                        <CardDescription>Top selling products by revenue</CardDescription>
+                      </CardHeader>
+                      <CardContent className="min-h-[250px] flex items-center justify-center">
+                        {productPerformanceData.length > 0 ? (
+                          <ResponsiveContainer width="100%" height={250}>
+                            <BarChart data={productPerformanceData} layout="vertical">
+                              <CartesianGrid strokeDasharray="3 3" />
+                              <XAxis type="number" label={{ value: 'Revenue ($)', position: 'insideBottom', offset: 0 }} />
+                              <YAxis type="category" dataKey="name" width={80} interval={0} label={{ value: 'Product', angle: -90, position: 'insideLeft' }} />
+                              <Tooltip formatter={(value: number, name: string) => [`${value.toLocaleString()}`, name]} />
+                              <Legend />
+                              <Bar dataKey="revenue" fill="#8884d8" name="Revenue" />
+                            </BarChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <p className="text-center text-muted-foreground py-8">No product performance data available.</p>
+                        )}
+                      </CardContent>
+                    </Card>
+
+                    {/* Region Performance */}
+                    <Card>
+                      <CardHeader>
+                        <CardTitle className="flex items-center"><MapPin className="h-4 w-4 mr-2" />Region Performance</CardTitle>
+                        <CardDescription>Revenue by geographical region</CardDescription>
+                      </CardHeader>
+                      <CardContent className="min-h-[250px] flex items-center justify-center">
+                        {regionPerformanceData.length > 0 ? (
+                          <ResponsiveContainer width="100%" height={250}>
+                            <PieChart>
+                              <Pie
+                                data={regionPerformanceData}
+                                cx="50%"
+                                cy="50%"
+                                labelLine={false}
+                                outerRadius={80}
+                                fill="#8884d8"
+                                dataKey="revenue"
+                                nameKey="region"
+                                label={({ region, percent }) => `${region} ${(percent * 100).toFixed(0)}%`}
+                              >
+                                {regionPerformanceData.map((entry, index) => (
+                                  <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                                ))}
+                              </Pie>
+                              <Tooltip formatter={(value: number) => [`$${value.toLocaleString()}`, 'Revenue']} />
+                              <Legend />
+                            </PieChart>
+                          </ResponsiveContainer>
+                        ) : (
+                          <p className="text-center text-muted-foreground py-8">No region performance data available.</p>
+                        )}
+                      </CardContent>
+                    </Card>
+
                   </div>
                 </>
               )}
@@ -1108,7 +1320,8 @@ export default function Results() {
                     decision.urgency === 'Medium' ? 'border-orange-500' :
                     'border-green-500'
                   }`}>
-                    <h4 className="font-semibold text-lg flex items-center">
+                    {/* FIX: Changed <p> to <div> to resolve DOM nesting warning */}
+                    <div className="font-semibold text-lg flex items-center">
                       <Badge variant="outline" className={`mr-2 capitalize ${
                         decision.urgency === 'High' ? 'text-red-600 border-red-300' :
                         decision.urgency === 'Medium' ? 'text-orange-600 border-orange-300' :
@@ -1117,7 +1330,7 @@ export default function Results() {
                         {decision.urgency} Urgency
                       </Badge>
                       {decision.recommendation}
-                    </h4>
+                    </div>
                     <p className="text-sm text-muted-foreground mt-1">{decision.rationale}</p>
                     <p className="text-xs text-gray-500 mt-1">Category: <Badge variant="secondary" className="capitalize">{decision.category.replace(/_/g, ' ')}</Badge></p>
                   </div>

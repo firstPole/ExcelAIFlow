@@ -47,7 +47,7 @@ export interface CreateTaskDto {
 
 // Define the structure for AI Insights (matching backend)
 export interface AiInsight {
-  type: 'product_performance' | 'region_performance' | 'sales_trend' | 'error_anomaly';
+  type: 'product_performance' | 'region_performance' | 'sales_trend' | 'error_anomaly' | 'operational_efficiency' | 'financial_overview' | 'customer_relations' | 'risk_management' | string; // Added more types and string for flexibility
   title: string;
   description: string;
   data?: any; // Optional structured data supporting the insight (e.g., chart data)
@@ -55,51 +55,63 @@ export interface AiInsight {
 
 // Define the structure for Decision Recommendations (matching backend)
 export interface DecisionRecommendation {
-  type: 'decision';
   title: string;
   recommendation: string;
   rationale: string;
   urgency: 'High' | 'Medium' | 'Low';
-  category: 'marketing' | 'sales' | 'operations' | 'data_quality' | 'efficiency' | 'revenue' | 'risk_mitigation' | 'customer_experience' | 'resource_optimization';
+  category: 'marketing' | 'sales' | 'operations' | 'data_quality' | 'efficiency' | 'revenue' | 'risk_mitigation' | 'customer_experience' | 'resource_optimization' | string; // Added more categories and string for flexibility
 }
 
 // Define types for aggregated data that will be part of the insights response
-export interface ProductSalesData {
-  productName: string;
-  totalRevenue: number;
-  totalUnitsSold: number;
+export interface ProcessingTrendData {
+  date: string; // e.g., '2025-07-20'
+  completed: number;
+  failed: number;
 }
 
-export interface RegionSalesData {
-  regionName: string;
-  totalRevenue: number;
-  totalUnitsSold: number;
-  prevPeriodRevenue: number; // For week-over-week comparison
+export interface DataQualityDistributionData {
+  name: string; // e.g., 'Formatting Errors', 'Schema Mismatch'
+  value: number; // count of errors
 }
 
-export interface WeeklySalesTrendData {
-  period: string;
-  sales: number;
-  prevSales: number;
+export interface SalesTrendData {
+  date: string; // e.g., 'Wk 1', '2025-07-20'
+  revenue: number;
+  units_sold: number;
 }
 
-export interface ErrorDistributionData {
-  name: string;
-  value: number; // Percentage
+export interface ProductPerformanceData {
+  name: string; // e.g., 'Book', 'Pen'
+  revenue: number;
+  units_sold: number;
+}
+
+export interface RegionPerformanceData {
+  region: string; // e.g., 'North', 'South'
+  revenue: number;
+  units_sold: number;
 }
 
 // Define the combined response structure for insights and decisions, including aggregated data
+// This interface is updated to match the backend's `analyticsData` nesting
 export interface AiInsightsAndDecisionsResponse {
   insights: AiInsight[];
   decisions: DecisionRecommendation[];
-  // Add aggregated data fields that are now returned by the /analytics/insights endpoint
-  productSales: ProductSalesData[];
-  regionSales: RegionSalesData[];
-  weeklySalesTrends: WeeklySalesTrendData[];
-  errorDistribution: ErrorDistributionData[];
-  totalCompletedTasks: number;
-  totalRecordsProcessed: number;
-  totalErrorsFound: number;
+  analyticsData: { // This matches the structure returned by the backend now
+    processingTrends: ProcessingTrendData[];
+    dataQualityDistribution: DataQualityDistributionData[];
+    salesTrends: SalesTrendData[];
+    productPerformance: ProductPerformanceData[];
+    regionPerformance: RegionPerformanceData[];
+  };
+}
+
+// AiSettings interface
+export interface AiSettings {
+  provider: string;
+  model: string;
+  temperature: number;
+  maxTokens: number;
 }
 
 
@@ -241,27 +253,9 @@ export const WorkflowService = {
   },
 
   /**
-   * Fetches processing trends data for analytics.
-   * @param period The time period for which to fetch trends (e.g., '7days', '30days').
-   * @returns A Promise that resolves with an array of trend data.
-   * @throws An error if fetching trends fails.
-   */
-  async getProcessingTrends(period: string): Promise<Array<{ period: string; completed: number; failed: number }>> {
-    try {
-      const response = await api.get<Array<{ period: string; completed: number; failed: number }>>(`/api/workflows/analytics/processing-trends?period=${period}`);
-      return response.data;
-    } catch (error: unknown) {
-      const axiosError = error as AxiosError<{ message?: string; code?: string }>;
-      throw new Error(axiosError.response?.data?.message || 'Failed to fetch processing trends.');
-    }
-  },
-
-  // REMOVED: getDataQualityDistribution is no longer a separate endpoint.
-  // Its data is now part of the getAiInsightsAndDecisions response.
-
-  /**
    * Fetches AI-generated insights and decisions, including comprehensive aggregated data.
    * @param period The time period for which to generate insights.
+   * @param aiSettings AI configuration settings (provider, model, temperature, maxTokens).
    * @returns A Promise that resolves with an AiInsightsAndDecisionsResponse object.
    * @throws An error if fetching insights fails.
    */
@@ -270,8 +264,8 @@ export const WorkflowService = {
       // Construct query parameters from aiSettings
       const params = new URLSearchParams({
         period: period,
-        aiProvider: aiSettings.provider,
-        aiModel: aiSettings.model,
+        provider: aiSettings.provider, // Use 'provider' as expected by backend
+        model: aiSettings.model,
         temperature: aiSettings.temperature.toString(),
         maxTokens: aiSettings.maxTokens.toString(),
       }).toString();

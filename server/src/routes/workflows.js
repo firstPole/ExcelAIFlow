@@ -10,7 +10,7 @@ import { adviseOnDecisions } from '../agents/decisionAdvisorAgent.js';        //
 import { callLLM } from '../lib/llmClient.js';  
 import { getAggregatedBusinessData } from '../utils/dataAggregator.js';  
 const router = express.Router();
-
+const serverAnalyticsCache = new Map();
 // --- Helper Functions (ALL YOUR ORIGINAL HELPER FUNCTIONS ARE RESTORED HERE) ---
 
 const isValidDate = (dateString) => {
@@ -1323,14 +1323,13 @@ router.get('/analytics/insights', authenticateToken, async (req, res) => {
         const userId = req.user.userId;
 
         const period = req.query.period || '30days';
-        let dateFilter = 'datetime(\'now\', \'-30 days\')';
+        const cacheKey = `${userId}-${period}`;
 
-        if (period === '7days') {
-            dateFilter = 'datetime(\'now\', \'-7 days\');';
-        } else if (period === '6months') {
-            dateFilter = 'datetime(\'now\', \'-6 months\');';
-        } else if (period === '12months') {
-            dateFilter = 'datetime(\'now\', \'-12 months\');';
+        // --- Check Cache First ---
+        if (serverAnalyticsCache.has(cacheKey)) {
+            const cachedData = serverAnalyticsCache.get(cacheKey);
+            logger.info(`[Backend] Analytics data for user ${userId}, period ${period} loaded from server cache.`);
+            return res.json(cachedData); // Return cached data immediately
         }
 
         // Fetch user's AI settings from the database or use system defaults
@@ -1340,7 +1339,6 @@ router.get('/analytics/insights', authenticateToken, async (req, res) => {
             model: process.env.DEFAULT_LLM_MODEL || 'llama3',
             temperature: parseFloat(process.env.DEFAULT_LLM_TEMPERATURE || '0.7'),
             maxTokens: parseInt(process.env.DEFAULT_LLM_MAX_TOKENS || '2048'),
-            // API key is sourced from environment variables for backend use, not from DB for security
             aiProviderApiKey: process.env.GEMINI_API_KEY || process.env.OLLAMA_API_KEY || ''
         };
 
@@ -1358,18 +1356,26 @@ router.get('/analytics/insights', authenticateToken, async (req, res) => {
         logger.info(`[Backend] Fetching AI insights and decisions for user ${userId}, period ${period} with settings:`, userAISettings);
 
         // 1. Aggregate business data and operational metrics using the new generic aggregator
-        // Note: The `getAggregatedBusinessData` function should not depend on `req.query` for AI settings,
-        // it only needs userId and period. The AI settings are for the LLM call itself.
-        const analyticsDataForLLM = await getAggregatedBusinessData(userId, period);
+        const aggregatedData = await getAggregatedBusinessData(userId, period);
 
         // 2. Generate insights and decisions using the LLM
-        // Pass userAISettings (which now correctly includes provider, model, etc., from DB/env) to both agents
-        const insights = await generateBusinessInsights(callLLM, analyticsDataForLLM, userAISettings);
+        const insights = await generateBusinessInsights(callLLM, aggregatedData, userAISettings);
         const decisions = await adviseOnDecisions(callLLM, insights, userAISettings);
 
-        // 3. Send combined response
-        logger.info(`[Backend] Sending final AI insights and decisions to frontend:`, { insights, decisions });
-        res.json({ insights, decisions });
+        // 3. Prepare the full response object
+        const fullResponse = {
+            insights: insights,
+            decisions: decisions,
+            analyticsData: aggregatedData.analyticsChartsData // Include the structured data for charts
+        };
+
+        // --- Cache the response ---
+        serverAnalyticsCache.set(cacheKey, fullResponse);
+        logger.info(`[Backend] Analytics data for user ${userId}, period ${period} cached on server.`);
+
+        // 4. Send combined response
+        logger.info(`[Backend] Sending final AI insights and decisions to frontend:`, fullResponse);
+        res.json(fullResponse);
 
     } catch (error) {
         logger.error('[Backend] Error generating AI insights or decisions:', error);
